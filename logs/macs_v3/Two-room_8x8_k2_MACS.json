@@ -1,0 +1,55 @@
+{
+  "label": "Two-room_8x8_k2_MACS",
+  "config": {
+    "method": "MACS",
+    "env_name": "Two-room 8x8",
+    "k": 2,
+    "map_size": 8,
+    "horizon": 15,
+    "max_cells": 57,
+    "n_episodes": 30,
+    "clip_budget": false,
+    "F_total": 57.0
+  },
+  "per_block": {
+    "episode": [
+      10,
+      20,
+      30
+    ],
+    "coverage_mean": [
+      26.4,
+      27.8,
+      27.4
+    ],
+    "eval_coverage": [
+      18.0,
+      22.0,
+      27.0
+    ],
+    "loss": [
+      null,
+      0.44533,
+      0.32118
+    ],
+    "epsilon": [
+      0.525,
+      0.05,
+      0.05
+    ],
+    "credit_sum_err": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "clip_frac": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "summary": {
+    "last5_train": 27.2,
+    "final_eval": 27.0
+  }
+}

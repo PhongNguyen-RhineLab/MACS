@@ -1,0 +1,55 @@
+{
+  "label": "Saturating_8x8_k2_DR",
+  "config": {
+    "method": "DR",
+    "env_name": "Saturating 8x8",
+    "k": 2,
+    "map_size": 8,
+    "horizon": 15,
+    "max_cells": 32.0,
+    "n_episodes": 30,
+    "clip_budget": false,
+    "F_total": 32.0
+  },
+  "per_block": {
+    "episode": [
+      10,
+      20,
+      30
+    ],
+    "coverage_mean": [
+      25.9,
+      28.4,
+      29.2
+    ],
+    "eval_coverage": [
+      21.5,
+      26.0,
+      29.5
+    ],
+    "loss": [
+      null,
+      0.39417,
+      0.18867
+    ],
+    "epsilon": [
+      0.525,
+      0.05,
+      0.05
+    ],
+    "credit_sum_err": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "clip_frac": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "summary": {
+    "last5_train": 27.83,
+    "final_eval": 29.5
+  }
+}

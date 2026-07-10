@@ -1,0 +1,55 @@
+{
+  "label": "Two-room_8x8_k2_QMIX",
+  "config": {
+    "method": "QMIX",
+    "env_name": "Two-room 8x8",
+    "k": 2,
+    "map_size": 8,
+    "horizon": 15,
+    "max_cells": 57,
+    "n_episodes": 30,
+    "clip_budget": false,
+    "F_total": 57.0
+  },
+  "per_block": {
+    "episode": [
+      10,
+      20,
+      30
+    ],
+    "coverage_mean": [
+      27.1,
+      28.1,
+      31.3
+    ],
+    "eval_coverage": [
+      16.0,
+      25.5,
+      28.5
+    ],
+    "loss": [
+      null,
+      0.73497,
+      0.59856
+    ],
+    "epsilon": [
+      0.525,
+      0.05,
+      0.05
+    ],
+    "credit_sum_err": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "clip_frac": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "summary": {
+    "last5_train": 28.83,
+    "final_eval": 28.5
+  }
+}

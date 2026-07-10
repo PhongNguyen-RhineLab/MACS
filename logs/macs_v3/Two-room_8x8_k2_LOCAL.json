@@ -1,0 +1,55 @@
+{
+  "label": "Two-room_8x8_k2_LOCAL",
+  "config": {
+    "method": "LOCAL",
+    "env_name": "Two-room 8x8",
+    "k": 2,
+    "map_size": 8,
+    "horizon": 15,
+    "max_cells": 57,
+    "n_episodes": 30,
+    "clip_budget": false,
+    "F_total": 57.0
+  },
+  "per_block": {
+    "episode": [
+      10,
+      20,
+      30
+    ],
+    "coverage_mean": [
+      29.0,
+      32.7,
+      34.0
+    ],
+    "eval_coverage": [
+      8.5,
+      25.5,
+      28.5
+    ],
+    "loss": [
+      null,
+      0.54889,
+      0.37463
+    ],
+    "epsilon": [
+      0.525,
+      0.05,
+      0.05
+    ],
+    "credit_sum_err": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "clip_frac": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "summary": {
+    "last5_train": 31.9,
+    "final_eval": 28.5
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "label": "Saturating_8x8_k2_SHARED",
+  "config": {
+    "method": "SHARED",
+    "env_name": "Saturating 8x8",
+    "k": 2,
+    "map_size": 8,
+    "horizon": 15,
+    "max_cells": 32.0,
+    "n_episodes": 30,
+    "clip_budget": false,
+    "F_total": 32.0
+  },
+  "per_block": {
+    "episode": [
+      10,
+      20,
+      30
+    ],
+    "coverage_mean": [
+      26.0,
+      29.2,
+      30.2
+    ],
+    "eval_coverage": [
+      20.0,
+      28.0,
+      32.0
+    ],
+    "loss": [
+      null,
+      1.08441,
+      0.57053
+    ],
+    "epsilon": [
+      0.525,
+      0.05,
+      0.05
+    ],
+    "credit_sum_err": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "clip_frac": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "summary": {
+    "last5_train": 28.47,
+    "final_eval": 32.0
+  }
+}

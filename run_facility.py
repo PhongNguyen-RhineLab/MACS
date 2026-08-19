@@ -45,7 +45,12 @@ LOG_DIR = {"o9": "logs/macs_facility", "o10": "logs/macs_clipcontrol"}
 DEFAULT_SEEDS = [0, 1, 2, 3, 4]
 
 TRAIN_CFG = dict(n_episodes=4000, eval_every=100, log_every=100)
-PILOT_CFG = dict(n_episodes=1200, eval_every=100, log_every=100, warmup=800)
+# 24x24 is four times the state space of the 12x12 saturating grid the
+# published runs used, so a short pilot risks measuring undertraining rather
+# than the ablation. 2500 episodes is the compromise; `inspect` reports
+# whether both arms are still rising at the end, which is the check that
+# matters more than the episode count itself.
+PILOT_CFG = dict(n_episodes=2500, eval_every=100, log_every=100, warmup=1500)
 SMOKE_CFG = dict(n_episodes=30, warmup=200, eval_every=10, n_eval=2,
                  log_every=10, target_every=10)
 
@@ -135,24 +140,69 @@ def final_metric(path, window=10):
         d = json.load(f)
     ev = [x for x in d["per_block"]["eval_coverage"] if x is not None]
     if len(ev) < window:
-        return None
-    return float(np.mean(ev[-window:]))
+        return None, len(ev)
+    return float(np.mean(ev[-window:])), len(ev)
 
 
-def collect(log_dir):
-    """{(env_name, k): {arm: {seed: metric}}}"""
-    out = {}
+def collect(log_dir, window=10):
+    """{(env_name, k): {arm: {seed: metric}}}, plus a skip report."""
+    out, short, n_files = {}, [], 0
     for p in sorted(Path(log_dir).glob("*seed*.json")):
         with open(p) as f:
             d = json.load(f)
         c = d["config"]
-        m = final_metric(p)
+        n_files += 1
+        m, n_blocks = final_metric(p, window)
         if m is None:
+            short.append((p.name, n_blocks))
             continue
         arm = f"{c['method']}/{c.get('obs_mode','shared')}/{c.get('clip','none')}"
         out.setdefault((c["env_name"], c["k"]), {}) \
            .setdefault(arm, {})[c.get("seed", 0)] = m
+    if short:
+        print(f"note: {len(short)} of {n_files} log(s) have fewer than "
+              f"{window} evaluation checkpoints and were skipped "
+              f"(e.g. {short[0][0]} has {short[0][1]}). This is expected for "
+              f"--smoke runs; pass --window to lower the requirement.")
     return out
+
+
+def inspect(log_dir):
+    """Per-run health check. Three things worth looking at before trusting
+    a sweep:
+
+      credit_err  max |sum_i phi_i - r_t|. Remark `efficiency-exact` says
+                  this is zero to machine precision for the permutation and
+                  subset estimators alike. A nonzero value means the
+                  facility closed form is NOT being used and the routing
+                  patch did not take.
+      rising      whether the last evaluation block is still above the one
+                  before it. If both arms are still rising, the run is
+                  undertrained and a null result is uninterpretable.
+      clip_frac   fraction of bootstrap targets cut, for the O10 arms.
+    """
+    rows = sorted(Path(log_dir).glob("*seed*.json"))
+    if not rows:
+        print(f"No logs in {log_dir}.")
+        return
+    print(f"\n{'run':<58} {'blocks':>6} {'last10':>8} {'credit_err':>11} "
+          f"{'rising':>7} {'clip':>6}")
+    print("-" * 100)
+    for p in rows:
+        with open(p) as f:
+            d = json.load(f)
+        pb = d["per_block"]
+        ev = [x for x in pb["eval_coverage"] if x is not None]
+        err = max(pb.get("credit_sum_err") or [0.0])
+        cf = pb.get("clip_frac") or [0.0]
+        last10 = np.mean(ev[-10:]) if ev else float("nan")
+        rising = (len(ev) >= 4 and
+                  np.mean(ev[-2:]) > np.mean(ev[-4:-2]) + 1e-9)
+        flag = "  <-- credit error nonzero" if err > 1e-6 else ""
+        print(f"{p.stem[:58]:<58} {len(ev):>6} {last10:>8.2f} "
+              f"{err:>11.2e} {str(rising):>7} {np.mean(cf):>6.3f}{flag}")
+    print("\nrising=True on every arm means the sweep is undertrained; a "
+          "null difference there is not evidence of no difference.")
 
 
 COMPARISONS = {
@@ -165,8 +215,8 @@ COMPARISONS = {
 }
 
 
-def aggregate(exp, log_dir, out_path=None):
-    data = collect(log_dir)
+def aggregate(exp, log_dir, out_path=None, window=10):
+    data = collect(log_dir, window)
     if not data:
         print(f"No seed-labelled logs in {log_dir}.")
         return
@@ -225,6 +275,10 @@ if __name__ == "__main__":
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--aggregate", action="store_true")
     ap.add_argument("--log-dir", default=None)
+    ap.add_argument("--window", type=int, default=10,
+                    help="evaluation checkpoints averaged per seed")
+    ap.add_argument("--inspect", action="store_true",
+                    help="print per-run diagnostics and exit")
     args = ap.parse_args()
 
     exp = args.exp
@@ -232,8 +286,12 @@ if __name__ == "__main__":
     ks = args.ks or ([2, 3, 4, 6, 8] if exp == "o9" else [2, 3, 4, 6])
     seeds = args.seeds
 
+    if args.inspect:
+        inspect(log_dir)
+        sys.exit(0)
+
     if args.aggregate:
-        aggregate(exp, log_dir,
+        aggregate(exp, log_dir, window=args.window,
                   out_path=Path(log_dir) / f"{exp}_summary.txt")
         sys.exit(0)
 
@@ -265,4 +323,7 @@ if __name__ == "__main__":
         print("\ntorch unavailable; cannot train here.")
         sys.exit(1)
     execute(exp, rows, cfg, log_dir)
-    aggregate(exp, log_dir, out_path=Path(log_dir) / f"{exp}_summary.txt")
+    inspect(log_dir)
+    aggregate(exp, log_dir,
+              window=min(args.window, cfg["n_episodes"] // cfg["log_every"]),
+              out_path=Path(log_dir) / f"{exp}_summary.txt")

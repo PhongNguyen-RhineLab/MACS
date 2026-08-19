@@ -43,6 +43,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from decimal import Decimal, ROUND_HALF_UP
 
 # macs_v3 import has two side effects we rely on:
 #   1. it re-points macs_main.compute_credits to the v3 dispatcher
@@ -200,6 +201,48 @@ def exact_perm_test(a, b, n_max_exact=2 ** 16):
     return float(obs), p
 
 
+def r1(x):
+    """Round half AWAY FROM ZERO to one decimal.
+
+    Python's format() and round() use banker's rounding, so 52.75 -> 52.7
+    and 125.65 -> 125.6, which disagrees with the hand-typed paper table in
+    five cells. The paper convention is half-up; this makes the emitted
+    LaTeX match it.
+    """
+    return float(Decimal(repr(float(x))).quantize(Decimal("0.1"),
+                                                  rounding=ROUND_HALF_UP))
+
+
+def f1(x):
+    return f"{r1(x):.1f}"
+
+
+# Pairwise seed-level comparisons reported in the paper. Both rows of the
+# bottom block of the results table are produced from this list, at every
+# configuration -- earlier versions hardcoded k in (4, 6) for the first
+# comparison and never emitted the second at all.
+COMPARISONS = [
+    ("MACS-CLIP", "LOCAL", "clip vs. strongest baseline"),
+    ("MACS-CLIP", "MACS", "clip ablation, identical credits"),
+]
+
+
+def run_comparisons(by_mode):
+    """Returns [(hi, lo, note, diff, p)] for every comparison available."""
+    out = []
+    for hi, lo, note in COMPARISONS:
+        if hi not in by_mode or lo not in by_mode:
+            continue
+        seeds = sorted(set(by_mode[hi]) & set(by_mode[lo]))
+        if len(seeds) < 2:
+            continue
+        a = [by_mode[hi][s] for s in seeds]
+        b = [by_mode[lo][s] for s in seeds]
+        diff, p = exact_perm_test(a, b)
+        out.append((hi, lo, note, diff, p, len(seeds)))
+    return out
+
+
 def aggregate(log_dir=LOG_DIR, out_path=None):
     data = collect(log_dir)
     if not data:
@@ -222,16 +265,11 @@ def aggregate(log_dir=LOG_DIR, out_path=None):
             lines.append(f"{mode:<10} {len(arr):>7} {arr.mean():>8.2f} "
                          f"{arr.std(ddof=1):>7.2f}  [{per_seed}]")
 
-        # O6 significance test: MACS-CLIP vs LOCAL at k in {4, 6}
-        if k in (4, 6) and "MACS-CLIP" in by_mode and "LOCAL" in by_mode:
-            va, vb = by_mode["MACS-CLIP"], by_mode["LOCAL"]
-            common_note = ""
-            a = [va[s] for s in sorted(va)]
-            b = [vb[s] for s in sorted(vb)]
-            diff, p = exact_perm_test(a, b)
-            lines.append(f"  MACS-CLIP vs LOCAL: diff of seed means = "
-                         f"{diff:+.2f}, exact permutation p = {p:.4f}"
-                         f" (two-sided){common_note}")
+        # Significance tests: every comparison in COMPARISONS, every config.
+        for hi, lo, note, diff, p, n in run_comparisons(by_mode):
+            lines.append(f"  {hi} vs {lo}: diff of seed means = {diff:+.2f}, "
+                         f"exact permutation p = {p:.4f} (two-sided, "
+                         f"n={n}+{n})   [{note}]")
 
     report = "\n".join(lines)
     print(report)
@@ -240,18 +278,59 @@ def aggregate(log_dir=LOG_DIR, out_path=None):
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w") as f:
             f.write(report + "\n")
-            f.write("\n\n% LaTeX rows (mean \\pm std over seeds):\n")
+            f.write("\n\n% LaTeX rows (mean \\pm std over seeds, "
+                    "half-up rounding):\n")
+            ks = []
             for (env_name, k), by_mode in sorted(data.items(),
                                                  key=lambda x: x[0][1]):
+                ks.append(k)
                 row = [f"${env_name.split()[-1]}$, $k{{=}}{k}$"]
                 for mode in MODES:
                     if mode in by_mode:
                         arr = np.array(list(by_mode[mode].values()))
-                        row.append(f"${arr.mean():.1f}{{\\pm}}"
-                                   f"{arr.std(ddof=1):.1f}$")
+                        row.append(f"${f1(arr.mean())}{{\\pm}}"
+                                   f"{f1(arr.std(ddof=1))}$")
                     else:
                         row.append("--")
                 f.write(" & ".join(row) + r" \\" + "\n")
+
+            # bottom block of the results table: one row per comparison
+            f.write("\n% p-value rows (exact two-sided permutation):\n")
+            for hi, lo, note in COMPARISONS:
+                cells = []
+                for (env_name, k), by_mode in sorted(data.items(),
+                                                     key=lambda x: x[0][1]):
+                    got = {(h, l): (d, p) for h, l, _, d, p, _
+                           in run_comparisons(by_mode)}
+                    if (hi, lo) in got:
+                        cells.append(f"$k{{=}}{k}$: ${got[(hi, lo)][1]:.3f}$")
+                if not cells:
+                    continue
+                label = ("Clip vs.\\ LOCAL" if lo == "LOCAL"
+                         else "Clip vs.\\ MACS")
+                f.write(f"{label}, $p$ & \\multicolumn{{7}}{{c}}{{%\n"
+                        + " \\quad ".join(cells) + "} \\\\\n")
+
+            # machine-readable summary, small enough to commit alongside code
+            summ = {}
+            for (env_name, k), by_mode in sorted(data.items(),
+                                                 key=lambda x: x[0][1]):
+                key = f"{env_name}|k={k}"
+                summ[key] = {
+                    "methods": {m: {"seeds": {str(s): v for s, v in
+                                              sorted(vals.items())},
+                                    "mean": float(np.mean(list(vals.values()))),
+                                    "std": float(np.std(list(vals.values()),
+                                                        ddof=1))}
+                                for m, vals in sorted(by_mode.items())},
+                    "tests": [{"hi": h, "lo": l, "note": nt, "diff": d,
+                               "p": p, "n_seeds": n}
+                              for h, l, nt, d, p, n
+                              in run_comparisons(by_mode)]}
+            jp = Path(out_path).with_suffix(".json")
+            with open(jp, "w") as jf:
+                json.dump(summ, jf, indent=2)
+            print(f"Written: {jp}")
         print(f"\nWritten: {out_path}")
 
 

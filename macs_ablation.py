@@ -195,7 +195,8 @@ if TORCH_OK:
                "config": dict(method=mode, env_name=env_name, k=k,
                               map_size=size, horizon=H,
                               max_cells=env.max_cells, n_episodes=n_episodes,
-                              obs_mode=obs_mode, clip=clip, seed=seed),
+                              obs_mode=obs_mode, clip=clip, seed=seed,
+                              lr=lr, gamma=gamma, batch_size=batch_size),
                "per_block": {key: [] for key in
                              ("episode", "coverage_mean", "eval_coverage",
                               "loss", "epsilon", "credit_sum_err",

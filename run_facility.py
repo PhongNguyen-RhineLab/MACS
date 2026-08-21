@@ -8,6 +8,25 @@ O9  Augmented-state ablation on the facility objective.
     agents, which is what Theorem `sufficient-statistic` actually needs.
     Neither arm clips, so the observation is the only difference.
 
+O9-LR  Learning-rate robustness for the private arm.
+    The k=6 pilot showed the private arm DIVERGING rather than converging
+    to an information-limited optimum: its TD loss climbs monotonically
+    (0.11 -> 18.3 over 2500 episodes) and its evaluation score peaks at
+    episode 200 and decays to 34.7% of F(V) -- roughly half what a
+    non-learning greedy blind policy scores on the same configuration
+    (67.7%). That is consistent with Theorem `sufficient-statistic`:
+    without S_t the per-agent process is not Markov, the credit phi_i for
+    a given private state varies with unobserved teammate history, and
+    the contraction argument of Lemma `contraction` does not apply.
+
+    But it also means the pilot's 197-point gap confounds two things: the
+    information deficit (bounded by the policy-level probe at ~122 points)
+    and a learnability failure (the rest). Before reporting either, sweep
+    the private arm over learning rates. If it diverges at every rate, the
+    divergence is intrinsic to the observation and can be claimed as such;
+    if a lower rate converges near the blind-greedy floor, report the
+    information gap and the instability separately.
+
 O10 Isolating the budget clip on the saturating suite.
     MACS-CLIP (state-dependent ceiling B(S')) vs clip="const" (a
     state-INDEPENDENT ceiling matched to the mean of B(S')), k in
@@ -20,6 +39,8 @@ number of blocks, so the script can be interrupted and relaunched.
 Usage:
   python run_facility.py --dry-run                  print the plan, train nothing
   python run_facility.py --pilot                    2 runs, 1 seed, k=6 (do this first)
+  python run_facility.py --exp o9lr                 3 private runs at 3 learning rates
+  python run_facility.py --exp o9 --lr 2e-4         override the learning rate
   python run_facility.py --exp o9                   full O9 sweep
   python run_facility.py --exp o10                  full O10 sweep
   python run_facility.py --exp o9 --seeds 0 1 2     subset of seeds
@@ -41,7 +62,12 @@ from macs_v3 import SaturatingCoverageEnv
 from macs_ablation import install_facility_credits, run_checks
 from run_multiseed_sat import exact_perm_test, r1
 
-LOG_DIR = {"o9": "logs/macs_facility", "o10": "logs/macs_clipcontrol"}
+LOG_DIR = {"o9": "logs/macs_facility", "o10": "logs/macs_clipcontrol",
+           "o9lr": "logs/macs_facility_lr"}
+
+# Learning rates for the O9-LR robustness arm. 5e-4 is the published
+# setting and the one that diverged in the pilot.
+LR_GRID = [5e-4, 2e-4, 1e-4]
 DEFAULT_SEEDS = [0, 1, 2, 3, 4]
 
 TRAIN_CFG = dict(n_episodes=4000, eval_every=100, log_every=100)
@@ -74,15 +100,25 @@ def saturating_factory(k):
                                          cap_frac=0.5, **c)
 
 
-def plan(exp, ks, seeds):
-    """[(env_name, k, mode, obs_mode, clip, seed, factory)]"""
+def plan(exp, ks, seeds, lr=None):
+    """[(env_name, k, mode, obs_mode, clip, seed, lr, factory)]"""
     out = []
-    if exp == "o9":
+    if exp == "o9lr":
+        # Both arms at every rate: the shared arm is the control that shows
+        # whether a rate change moves the converging arm too.
+        name = f"Facility {FACILITY['size']}x{FACILITY['size']}"
+        for k in ks:
+            for rate in LR_GRID:
+                for obs in ("private", "shared"):
+                    for s in seeds:
+                        out.append((name, k, "MACS", obs, "none", s, rate,
+                                    facility_factory(k)))
+    elif exp == "o9":
         for k in ks:
             name = f"Facility {FACILITY['size']}x{FACILITY['size']}"
             for obs in ("shared", "private"):
                 for s in seeds:
-                    out.append((name, k, "MACS", obs, "none", s,
+                    out.append((name, k, "MACS", obs, "none", s, lr,
                                 facility_factory(k)))
     else:
         for k in ks:
@@ -92,14 +128,17 @@ def plan(exp, ks, seeds):
                                ("MACS-CLIP", "const"),
                                ("MACS", "none")):
                 for s in seeds:
-                    out.append((name, k, mode, "shared", clip, s,
+                    out.append((name, k, mode, "shared", clip, s, lr,
                                 saturating_factory(k)))
     return out
 
 
-def label_of(env_name, k, mode, obs, clip, seed):
-    return (f"{env_name.replace(' ', '_')}_k{k}_{mode}"
-            f"_{obs}_clip-{clip}_seed{seed}")
+def label_of(env_name, k, mode, obs, clip, seed, lr=None):
+    base = (f"{env_name.replace(' ', '_')}_k{k}_{mode}"
+            f"_{obs}_clip-{clip}")
+    if lr is not None:
+        base += f"_lr{lr:g}"
+    return f"{base}_seed{seed}"
 
 
 def is_complete(label, log_dir, n_episodes, log_every):
@@ -119,14 +158,17 @@ def execute(exp, rows, cfg, log_dir):
     from macs_ablation import train_ablation
     n_ep, log_ev = cfg["n_episodes"], cfg["log_every"]
     done = skipped = 0
-    for env_name, k, mode, obs, clip, seed, factory in rows:
-        lab = label_of(env_name, k, mode, obs, clip, seed)
+    for env_name, k, mode, obs, clip, seed, lr, factory in rows:
+        lab = label_of(env_name, k, mode, obs, clip, seed, lr)
         if is_complete(lab, log_dir, n_ep, log_ev):
             print(f"  skip (complete): {lab}")
             skipped += 1
             continue
+        kw = dict(cfg)
+        if lr is not None:
+            kw["lr"] = lr
         train_ablation(factory, env_name=env_name, mode=mode, obs_mode=obs,
-                       clip=clip, seed=seed, label=lab, log_dir=log_dir, **cfg)
+                       clip=clip, seed=seed, label=lab, log_dir=log_dir, **kw)
         done += 1
     print(f"\n{done} run(s) completed, {skipped} skipped.")
 
@@ -157,6 +199,8 @@ def collect(log_dir, window=10):
             short.append((p.name, n_blocks))
             continue
         arm = f"{c['method']}/{c.get('obs_mode','shared')}/{c.get('clip','none')}"
+        if c.get("lr") is not None:
+            arm += f"/lr{c['lr']:g}"
         out.setdefault((c["env_name"], c["k"]), {}) \
            .setdefault(arm, {})[c.get("seed", 0)] = m
     if short:
@@ -199,15 +243,34 @@ def inspect(log_dir):
         rising = (len(ev) >= 4 and
                   np.mean(ev[-2:]) > np.mean(ev[-4:-2]) + 1e-9)
         flag = "  <-- credit error nonzero" if err > 1e-6 else ""
+        # divergence: TD loss still climbing over the last third AND
+        # evaluation below its own peak. Both together distinguish a
+        # diverging run from one that is merely still learning.
+        ls = [x for x in (pb.get("loss") or []) if x is not None]
+        # Compare the tail against the MIDPOINT, not against the previous
+        # block. A diverging run climbs steadily rather than accelerating,
+        # so consecutive thirds can look flat while the run has grown by an
+        # order of magnitude overall: the k=6 pilot's private arm went
+        # 0.11 -> 3.3 -> 18.3, and a consecutive-thirds test missed it.
+        mid = len(ls) // 2
+        diverging = (len(ls) >= 8 and len(ev) >= 8
+                     and np.mean(ls[-3:]) > 1.5 * np.mean(ls[mid-1:mid+2])
+                     and last10 < 0.9 * max(ev))
+        if diverging:
+            flag += "  <-- DIVERGING (loss climbing, eval past peak)"
         print(f"{p.stem[:58]:<58} {len(ev):>6} {last10:>8.2f} "
               f"{err:>11.2e} {str(rising):>7} {np.mean(cf):>6.3f}{flag}")
     print("\nrising=True on every arm means the sweep is undertrained; a "
           "null difference there is not evidence of no difference.")
+    print("DIVERGING means the run did not converge, so its score is not "
+          "an information-limited optimum and should not be read as one.")
 
 
 COMPARISONS = {
     "o9": [("MACS/shared/none", "MACS/private/none",
             "value of the shared augmented state")],
+    "o9lr": [(f"MACS/shared/none/lr{r:g}", f"MACS/private/none/lr{r:g}",
+              f"shared vs private at lr={r:g}") for r in LR_GRID],
     "o10": [("MACS-CLIP/shared/budget", "MACS-CLIP/shared/const",
              "state-dependent vs constant ceiling"),
             ("MACS-CLIP/shared/budget", "MACS/shared/none",
@@ -267,7 +330,9 @@ def aggregate(exp, log_dir, out_path=None, window=10):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--exp", choices=["o9", "o10"], default="o9")
+    ap.add_argument("--exp", choices=["o9", "o10", "o9lr"], default="o9")
+    ap.add_argument("--lr", type=float, default=None,
+                    help="override the learning rate (default 5e-4)")
     ap.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS)
     ap.add_argument("--ks", type=int, nargs="+", default=None)
     ap.add_argument("--pilot", action="store_true")
@@ -283,7 +348,8 @@ if __name__ == "__main__":
 
     exp = args.exp
     log_dir = args.log_dir or LOG_DIR[exp]
-    ks = args.ks or ([2, 3, 4, 6, 8] if exp == "o9" else [2, 3, 4, 6])
+    ks = args.ks or ({"o9": [2, 3, 4, 6, 8], "o9lr": [6]}.get(
+        exp, [2, 3, 4, 6]))
     seeds = args.seeds
 
     if args.inspect:
@@ -313,10 +379,16 @@ if __name__ == "__main__":
     else:
         cfg = TRAIN_CFG
 
-    rows = plan(exp, ks, seeds)
+    if exp == "o9lr":
+        seeds = seeds[:1]
+        print(f"\nO9-LR: private and shared arms at lr in "
+              f"{[f'{r:g}' for r in LR_GRID]}, k={ks}, one seed.\n"
+              f"Checks whether the private arm's divergence in the pilot is "
+              f"intrinsic to the observation or a tuning artifact.")
+    rows = plan(exp, ks, seeds, lr=args.lr)
     print(f"\nPlan ({exp}): {len(rows)} runs into {log_dir}")
-    for env_name, k, mode, obs, clip, seed, _ in rows:
-        print(f"  {label_of(env_name, k, mode, obs, clip, seed)}")
+    for env_name, k, mode, obs, clip, seed, lr, _ in rows:
+        print(f"  {label_of(env_name, k, mode, obs, clip, seed, lr)}")
     if args.dry_run:
         sys.exit(0)
     if not M.TORCH_OK:

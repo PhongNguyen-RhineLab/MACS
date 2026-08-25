@@ -70,6 +70,9 @@ LOG_DIR = {"o9": "logs/macs_facility", "o10": "logs/macs_clipcontrol",
 LR_GRID = [5e-4, 2e-4, 1e-4]
 DEFAULT_SEEDS = [0, 1, 2, 3, 4]
 
+# 4000 episodes matches the published saturating runs, so the two suites
+# share a budget and "you gave them different amounts of training" is not
+# available as an objection. The k=6 pilot was still rising at 2500.
 TRAIN_CFG = dict(n_episodes=4000, eval_every=100, log_every=100)
 # 24x24 is four times the state space of the 12x12 saturating grid the
 # published runs used, so a short pilot risks measuring undertraining rather
@@ -88,6 +91,56 @@ FACILITY = dict(size=24, horizon=60, rho=4.0, patch=0, demand="uniform")
 # O10 reuses the exact saturating configurations of the paper's Table 2.
 SATURATING = {2: dict(size=12, horizon=40), 3: dict(size=12, horizon=40),
               4: dict(size=12, horizon=40), 6: dict(size=16, horizon=60)}
+
+
+# -----------------------------------------------------------------------
+# Reference policies as reported floors
+# -----------------------------------------------------------------------
+# A learned score is hard to read on its own. Four references bracket it:
+#
+#   random   what no policy at all achieves
+#   blind    greedy against the agent's OWN visited set, no learning.
+#            This is the one that matters: the k=6 pilot's LEARNED private
+#            agent scored 27% of F(V) against this policy's 67.7%, i.e.
+#            learning without S_t is worse than not learning. Reporting the
+#            floor is what makes that legible rather than looking like the
+#            private arm is merely weaker.
+#   dec      greedy against the SHARED set, no learning. The natural
+#            ceiling for the shared arm.
+#   coord    one-step sequential greedy oracle.
+#
+# Cached to disk, since they are deterministic given the seed and take a
+# few seconds per configuration.
+
+_ORACLE_CACHE = {}
+
+
+def oracle_floors(k, episodes=8, seed=0, cache_path=None):
+    """{'random':…, 'blind':…, 'dec':…, 'coord':…} in units of F(V)."""
+    key = (k, episodes, seed)
+    if key in _ORACLE_CACHE:
+        return _ORACLE_CACHE[key]
+    if cache_path and Path(cache_path).exists():
+        disk = json.loads(Path(cache_path).read_text())
+        if str(key) in disk:
+            _ORACLE_CACHE[key] = disk[str(key)]
+            return disk[str(key)]
+    from probe_fl import pol_random, pol_dec, pol_coord
+    from probe_blind import make_blind, rollout
+    cfg = dict(k=k, **FACILITY)
+    out = {}
+    for name, pol in (("random", pol_random), ("dec", pol_dec),
+                      ("coord", pol_coord), ("blind", make_blind)):
+        out[name] = rollout(FacilityCoverageEnv, cfg, pol, episodes, seed)
+    _ORACLE_CACHE[key] = out
+    if cache_path:
+        disk = {}
+        if Path(cache_path).exists():
+            disk = json.loads(Path(cache_path).read_text())
+        disk[str(key)] = out
+        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(cache_path).write_text(json.dumps(disk, indent=2))
+    return out
 
 
 def facility_factory(k):
@@ -278,7 +331,7 @@ COMPARISONS = {
 }
 
 
-def aggregate(exp, log_dir, out_path=None, window=10):
+def aggregate(exp, log_dir, out_path=None, window=10, show_floors=True):
     data = collect(log_dir, window)
     if not data:
         print(f"No seed-labelled logs in {log_dir}.")
@@ -286,13 +339,31 @@ def aggregate(exp, log_dir, out_path=None, window=10):
     lines = []
     for (env_name, k), by_arm in sorted(data.items(), key=lambda x: x[0][1]):
         lines.append(f"\n=== {env_name}, k={k} ===")
-        lines.append(f"{'arm':<32} {'n':>3} {'mean':>9} {'std':>7}  seeds")
+        F_V = FacilityCoverageEnv(k=k, **FACILITY).max_cells \
+            if env_name.startswith("Facility") else None
+        lines.append(f"{'arm':<32} {'n':>3} {'mean':>9} {'std':>7} "
+                     f"{'%F(V)':>7}  seeds")
         for arm in sorted(by_arm):
             v = by_arm[arm]
             a = np.array([v[s] for s in sorted(v)])
             per = ", ".join(f"{s}:{v[s]:.1f}" for s in sorted(v))
+            pct = f"{100*a.mean()/F_V:>6.1f}%" if F_V else " " * 7
             lines.append(f"{arm:<32} {len(a):>3} {a.mean():>9.2f} "
-                         f"{a.std(ddof=1) if len(a) > 1 else 0.0:>7.2f}  [{per}]")
+                         f"{a.std(ddof=1) if len(a) > 1 else 0.0:>7.2f} "
+                         f"{pct}  [{per}]")
+        if F_V is not None and show_floors:
+            fl = oracle_floors(k, cache_path=Path(log_dir) / "oracles.json")
+            lines.append("  -- non-learning reference policies --")
+            for nm, note in (("random", "no policy"),
+                             ("blind", "greedy on OWN set, no learning"),
+                             ("dec", "greedy on SHARED set, no learning"),
+                             ("coord", "sequential greedy oracle")):
+                lines.append(f"  {nm:<30} {'':>3} {fl[nm]:>9.2f} {'':>7} "
+                             f"{100*fl[nm]/F_V:>6.1f}%  ({note})")
+            lines.append(
+                "  NOTE: a learned arm scoring below `blind` has not found "
+                "an information-limited\n        optimum -- it is doing "
+                "worse than a policy that does no learning at all.")
         for hi, lo, note in COMPARISONS[exp]:
             if hi not in by_arm or lo not in by_arm:
                 continue
@@ -344,6 +415,10 @@ if __name__ == "__main__":
                     help="evaluation checkpoints averaged per seed")
     ap.add_argument("--inspect", action="store_true",
                     help="print per-run diagnostics and exit")
+    ap.add_argument("--no-floors", action="store_true",
+                    help="skip the non-learning reference policies")
+    ap.add_argument("--floors-only", action="store_true",
+                    help="compute and print the reference policies, then exit")
     args = ap.parse_args()
 
     exp = args.exp
@@ -356,8 +431,20 @@ if __name__ == "__main__":
         inspect(log_dir)
         sys.exit(0)
 
+    if args.floors_only:
+        print(f"{'k':>3} {'random':>9} {'blind':>9} {'dec':>9} {'coord':>9} "
+              f"| {'blind%':>7} {'dec%':>7}")
+        for k in ks:
+            F_V = FacilityCoverageEnv(k=k, **FACILITY).max_cells
+            fl = oracle_floors(k, cache_path=Path(log_dir) / "oracles.json")
+            print(f"{k:>3} {fl['random']:>9.1f} {fl['blind']:>9.1f} "
+                  f"{fl['dec']:>9.1f} {fl['coord']:>9.1f} | "
+                  f"{100*fl['blind']/F_V:>6.1f}% {100*fl['dec']/F_V:>6.1f}%")
+        sys.exit(0)
+
     if args.aggregate:
         aggregate(exp, log_dir, window=args.window,
+                  show_floors=not args.no_floors,
                   out_path=Path(log_dir) / f"{exp}_summary.txt")
         sys.exit(0)
 
@@ -398,4 +485,5 @@ if __name__ == "__main__":
     inspect(log_dir)
     aggregate(exp, log_dir,
               window=min(args.window, cfg["n_episodes"] // cfg["log_every"]),
+              show_floors=not args.no_floors,
               out_path=Path(log_dir) / f"{exp}_summary.txt")

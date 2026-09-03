@@ -156,6 +156,7 @@ if TORCH_OK:
         eps_start=1.0, eps_end=0.05, eps_frac=0.6,
         target_every=50, eval_every=100, n_eval=8,
         label=None, log_dir="logs/macs_ablation", log_every=100, seed=0,
+        diag=False, diag_episodes=32,
     ):
         assert obs_mode in ("shared", "private")
         assert clip in ("none", "budget", "const")
@@ -344,6 +345,19 @@ if TORCH_OK:
         out = Path(log_dir); out.mkdir(parents=True, exist_ok=True)
         with open(out / f"{label}.json", "w") as f:
             json.dump(log, f, indent=2)
+        # O9 collapse diagnostic. Runs after training on greedy rollouts,
+        # so it cannot perturb the training RNG and the run still reproduces
+        # seed-for-seed against the existing logs.
+        if diag:
+            from diag_o9 import diagnose, torch_qfn, report
+            d = diagnose(env_factory, torch_qfn(nets, size), obs_mode, k,
+                         episodes=diag_episodes, seed=seed)
+            d["cells_per_agent_ceiling"] = H + 1
+            log["diag"] = d
+            with open(out / f"{label}.json", "w") as f:
+                json.dump(log, f, indent=2)
+            report(d, label)
+
         print(f"  -> {log_dir}/{label}.json | "
               f"last-10 eval {log['summary']['last10_eval']}")
         return log

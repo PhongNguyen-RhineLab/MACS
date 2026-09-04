@@ -174,6 +174,104 @@ class FacilityCoverageEnv(MultiAgentCoverageEnv):
 
 
 # =============================================================================
+# Sparse-island demand (September 2026)
+# =============================================================================
+#
+# probe_islands.py: on uniform and clustered demand, coord - dec ~ 0 because
+# the shared S_t already coordinates a myopic greedy team, so no credit rule
+# can win asymptotically. Islands change the structure:
+#
+#   * demand is zero between islands, so the one-step marginal is zero
+#     there and a myopic policy stalls        -> planning headroom
+#   * all agents spawn in one depot, so their nearest islands coincide and
+#     someone has to yield                    -> assignment headroom
+#   * the horizon is too short to tile the map, so a stateless sweep loses
+#
+# Canonical config: size=24, horizon=30, rho=4, 8 islands of radius 1,
+# min_sep=8, eps=0, depot spawn. See PROBES_2026-09.md for the numbers.
+
+def island_demand(size, n_islands, radius, min_sep, eps, rng):
+    """Disjoint discs of demand 1, `eps` elsewhere, rescaled to sum size^2
+    so F(V) is comparable with the uniform and clustered modes."""
+    xs, ys = np.meshgrid(np.arange(size), np.arange(size), indexing="ij")
+    best = []
+    for _ in range(500):                     # restart until all fit
+        centres, tries = [], 0
+        while len(centres) < n_islands and tries < 200:
+            tries += 1
+            c = rng.integers(radius + 1, size - radius - 1, size=2)
+            if all(np.hypot(*(c - o)) >= min_sep for o in centres):
+                centres.append(c)
+        if len(centres) > len(best):
+            best = centres
+        if len(best) == n_islands:
+            break
+    centres = best
+    d = np.full((size, size), eps, dtype=np.float64)
+    for cx, cy in centres:
+        d[(xs - cx) ** 2 + (ys - cy) ** 2 <= radius ** 2] = 1.0
+    d *= (size * size) / d.sum()
+    return d, np.array(centres)
+
+
+class IslandF(FacilityLocationF):
+    """Facility location with sparse island demand. Still monotone
+    submodular; shapley_facility() applies unchanged."""
+
+    def __init__(self, size, rho, n_islands, radius, min_sep, eps,
+                 layout_seed):
+        super().__init__(size, rho=rho, demand="uniform")
+        self.demand_mode = "islands"
+        rng = np.random.default_rng(layout_seed)
+        self.d, self.centres = island_demand(size, n_islands, radius,
+                                             min_sep, eps, rng)
+        self._Fmax = float(self.d.sum())
+        self.radius = radius
+
+
+class IslandEnv(FacilityCoverageEnv):
+    """
+    Facility dynamics with island demand and a depot spawn.
+
+    layout_seed  fixes the island layout (None -> a new layout every reset,
+                 which a learner can only handle with a demand input channel;
+                 use an int for the fixed-layout benchmark).
+    depot        all k agents start inside a 3x3 block at a random location.
+    """
+
+    def __init__(self, size=24, horizon=30, k=2, rho=4.0, n_islands=8,
+                 radius=1, min_sep=8, eps=0.0, layout_seed=0, depot=True,
+                 seed=None):
+        self.rho_hint = float(rho)
+        self.depot = depot
+        self.layout_seed = layout_seed
+        self._isl = dict(rho=rho, n_islands=n_islands, radius=radius,
+                         min_sep=min_sep, eps=eps)
+        self._layout_rng = np.random.default_rng(seed)
+        super().__init__(size=size, horizon=horizon, k=k, patch=0, rho=rho,
+                         demand="uniform", seed=seed)
+
+    def _new_layout(self):
+        ls = (self.layout_seed if self.layout_seed is not None
+              else int(self._layout_rng.integers(2 ** 31)))
+        self.Ffl = IslandF(self.size, layout_seed=ls, **self._isl)
+        self.F = self.Ffl
+
+    def reset(self):
+        self._new_layout()
+        out = super().reset()
+        if self.depot:
+            c = self.rng.integers(2, self.size - 2, size=2)
+            self.pos = np.clip(c + self.rng.integers(-1, 2, size=(self.k, 2)),
+                               0, self.size - 1)
+            self.covered[:] = False
+            for i in range(self.k):
+                self.covered |= self._patch_mask(self.pos[i])
+            out = self._obs()
+        return out
+
+
+# =============================================================================
 # Closed-form exact Shapley for facility location
 # =============================================================================
 

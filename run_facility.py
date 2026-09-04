@@ -33,6 +33,16 @@ O10 Isolating the budget clip on the saturating suite.
     {2,3,4,6}, five seeds. If the constant reproduces the effect, the
     submodular structure is not what is doing the work.
 
+ISLANDS  Credit assignment benchmark on sparse-island demand (Sept 2026).
+    Uniform and clustered facility maps have coord - dec ~ 0: once S_t is
+    shared, myopic greedy is near-optimal and no credit rule can win.
+    probe_islands.py found a facility configuration with both planning
+    headroom (plan - dec ~ 45 points) and assignment headroom
+    (plan - plan_self ~ 11-24 points, growing with k). SHARED, VDN, QMIX,
+    MACS and MACS-CLIP at k in {3,4,6}, against oracle rows random / sweep
+    / dec / plan_self / plan. The claim to test: MACS closes more of the
+    plan - dec gap than the baselines, with the margin largest at k=6.
+
 Both sweeps resume: a run is skipped when its log already has the full
 number of blocks, so the script can be interrupted and relaunched.
 
@@ -46,6 +56,9 @@ Usage:
   python run_facility.py --exp o9 --seeds 0 1 2     subset of seeds
   python run_facility.py --exp o9 --ks 4 6          subset of team sizes
   python run_facility.py --aggregate --exp o9       summary + permutation tests
+  python run_facility.py --exp islands --pilot      k=6, seed 0, all five learners
+  python run_facility.py --exp islands --seeds 0 1 2 --ks 3 4 6
+  python run_facility.py --aggregate --exp islands
 """
 
 import argparse
@@ -57,13 +70,14 @@ import numpy as np
 
 import macs_main as M
 import macs_v3  # noqa: F401   rebinds compute_credits to the v3 dispatcher
-from macs_fl import FacilityCoverageEnv
+from macs_fl import FacilityCoverageEnv, IslandEnv
 from macs_v3 import SaturatingCoverageEnv
 from macs_ablation import install_facility_credits, run_checks
 from run_multiseed_sat import exact_perm_test, r1
 
 LOG_DIR = {"o9": "logs/macs_facility", "o10": "logs/macs_clipcontrol",
-           "o9lr": "logs/macs_facility_lr"}
+           "o9lr": "logs/macs_facility_lr", "islands": "logs/macs_islands",
+           "islandslr": "logs/macs_islands_lr"}
 
 # Learning rates for the O9-LR robustness arm. 5e-4 is the published
 # setting and the one that diverged in the pilot.
@@ -79,6 +93,8 @@ TRAIN_CFG = dict(n_episodes=4000, eval_every=100, log_every=100)
 # than the ablation. 2500 episodes is the compromise; `inspect` reports
 # whether both arms are still rising at the end, which is the check that
 # matters more than the episode count itself.
+ISLAND_PILOT_CFG = dict(n_episodes=8000, eval_every=200, log_every=200,
+                        warmup=1500)
 PILOT_CFG = dict(n_episodes=2500, eval_every=100, log_every=100, warmup=1500)
 SMOKE_CFG = dict(n_episodes=30, warmup=200, eval_every=10, n_eval=2,
                  log_every=10, target_every=10)
@@ -87,6 +103,19 @@ SMOKE_CFG = dict(n_episodes=30, warmup=200, eval_every=10, n_eval=2,
 # the configuration where the probe measured the largest S-value ladder
 # (7.9 / 13.5 / 17.9 / 21.2 / 19.6 at k = 2,3,4,6,8).
 FACILITY = dict(size=24, horizon=60, rho=4.0, patch=0, demand="uniform")
+
+# Islands: probe_islands.py canonical config. H=30 is load-bearing (at H=60
+# the assignment headroom collapses to ~2 points and the sweep recovers).
+# layout_seed=0 fixes the map, so no demand input channel is needed.
+ISLANDS = dict(size=24, horizon=30, rho=4.0, n_islands=8, radius=1,
+               min_sep=8, eps=0.0, layout_seed=0, depot=True)
+ISLAND_MODES = ("SHARED", "VDN", "QMIX", "MACS", "MACS-CLIP")
+# The k=6 pilot flagged VDN and QMIX as diverging at the published 5e-4.
+# A reviewer will read an untuned baseline as a stacked comparison, so
+# `islandslr` reruns the three baselines across the same grid the private
+# arm got in O9-LR. Whatever rate is best per baseline is what the headline
+# table should report.
+ISLANDLR_MODES = ("SHARED", "VDN", "QMIX")
 
 # O10 reuses the exact saturating configurations of the paper's Table 2.
 SATURATING = {2: dict(size=12, horizon=40), 3: dict(size=12, horizon=40),
@@ -147,6 +176,39 @@ def facility_factory(k):
     return lambda: FacilityCoverageEnv(k=k, **FACILITY)
 
 
+def island_factory(k):
+    return lambda: IslandEnv(k=k, **ISLANDS)
+
+
+def island_floors(k, episodes=10, seed=0, cache_path=None):
+    """{'random','sweep','dec','plan_self','plan'} in units of F(V).
+    plan - dec is the planning headroom, plan - plan_self the assignment
+    headroom; these are the two numbers a learned arm is read against."""
+    key = ("islands", k, episodes, seed)
+    if cache_path and Path(cache_path).exists():
+        disk = json.loads(Path(cache_path).read_text())
+        if str(key) in disk:
+            return disk[str(key)]
+    from probe_islands import rollout, build_policies
+    cfg = {kk: v for kk, v in dict(k=k, **ISLANDS).items()
+           if kk not in ("layout_seed", "depot")}
+    rand_layout = ISLANDS["layout_seed"] is None
+    F_V = IslandEnv(k=k, **ISLANDS).max_cells
+    out = {}
+    for name, pol in build_policies():
+        if name in ("random", "sweep", "dec", "plan_self", "plan"):
+            m, _ = rollout(cfg, pol, episodes, seed, rand_layout)
+            out[name] = m * F_V / 100.0
+    if cache_path:
+        disk = {}
+        if Path(cache_path).exists():
+            disk = json.loads(Path(cache_path).read_text())
+        disk[str(key)] = out
+        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(cache_path).write_text(json.dumps(disk, indent=2))
+    return out
+
+
 def saturating_factory(k):
     c = SATURATING[k]
     return lambda: SaturatingCoverageEnv(k=k, patch=1, region=4,
@@ -173,6 +235,22 @@ def plan(exp, ks, seeds, lr=None):
                 for s in seeds:
                     out.append((name, k, "MACS", obs, "none", s, lr,
                                 facility_factory(k)))
+    elif exp == "islandslr":
+        name = f"Islands {ISLANDS['size']}x{ISLANDS['size']}"
+        for k in ks:
+            for mode in ISLANDLR_MODES:
+                for rate in LR_GRID:
+                    for s in seeds:
+                        out.append((name, k, mode, "shared", "none", s, rate,
+                                    island_factory(k)))
+    elif exp == "islands":
+        name = f"Islands {ISLANDS['size']}x{ISLANDS['size']}"
+        for k in ks:
+            for mode in ISLAND_MODES:
+                clip = "budget" if mode == "MACS-CLIP" else "none"
+                for s in seeds:
+                    out.append((name, k, mode, "shared", clip, s, lr,
+                                island_factory(k)))
     else:
         for k in ks:
             c = SATURATING[k]
@@ -220,8 +298,21 @@ def execute(exp, rows, cfg, log_dir):
         kw = dict(cfg)
         if lr is not None:
             kw["lr"] = lr
-        train_ablation(factory, env_name=env_name, mode=mode, obs_mode=obs,
-                       clip=clip, seed=seed, label=lab, log_dir=log_dir, **kw)
+        if mode in ("VDN", "QMIX"):
+            # mixing baselines live in macs_main.train_macs. Its log config
+            # lacks seed/obs_mode/clip, which collect() needs, so patch them
+            # in after the run.
+            M.train_macs(factory, env_name=env_name, mode=mode, seed=seed,
+                         label=lab, log_dir=log_dir, **kw)
+            p = Path(log_dir) / f"{lab}.json"
+            d = json.loads(p.read_text())
+            d["config"].update(seed=seed, obs_mode=obs, clip=clip,
+                               lr=kw.get("lr", 5e-4))
+            p.write_text(json.dumps(d, indent=2))
+        else:
+            train_ablation(factory, env_name=env_name, mode=mode,
+                           obs_mode=obs, clip=clip, seed=seed, label=lab,
+                           log_dir=log_dir, **kw)
         done += 1
     print(f"\n{done} run(s) completed, {skipped} skipped.")
 
@@ -324,6 +415,16 @@ COMPARISONS = {
             "value of the shared augmented state")],
     "o9lr": [(f"MACS/shared/none/lr{r:g}", f"MACS/private/none/lr{r:g}",
               f"shared vs private at lr={r:g}") for r in LR_GRID],
+    "islandslr": [(f"MACS/shared/none/lr{r:g}", f"SHARED/shared/none/lr{r:g}",
+                   f"MACS vs team reward at lr={r:g}") for r in LR_GRID],
+    "islands": [("MACS/shared/none", "SHARED/shared/none",
+                 "Shapley credit vs team reward"),
+                ("MACS/shared/none", "VDN/shared/none",
+                 "Shapley credit vs additive mixing"),
+                ("MACS/shared/none", "QMIX/shared/none",
+                 "Shapley credit vs monotone mixing"),
+                ("MACS-CLIP/shared/budget", "MACS/shared/none",
+                 "budget clip on top of Shapley")],
     "o10": [("MACS-CLIP/shared/budget", "MACS-CLIP/shared/const",
              "state-dependent vs constant ceiling"),
             ("MACS-CLIP/shared/budget", "MACS/shared/none",
@@ -339,8 +440,12 @@ def aggregate(exp, log_dir, out_path=None, window=10, show_floors=True):
     lines = []
     for (env_name, k), by_arm in sorted(data.items(), key=lambda x: x[0][1]):
         lines.append(f"\n=== {env_name}, k={k} ===")
-        F_V = FacilityCoverageEnv(k=k, **FACILITY).max_cells \
-            if env_name.startswith("Facility") else None
+        if env_name.startswith("Facility"):
+            F_V = FacilityCoverageEnv(k=k, **FACILITY).max_cells
+        elif env_name.startswith("Islands"):
+            F_V = IslandEnv(k=k, **ISLANDS).max_cells
+        else:
+            F_V = None
         lines.append(f"{'arm':<32} {'n':>3} {'mean':>9} {'std':>7} "
                      f"{'%F(V)':>7}  seeds")
         for arm in sorted(by_arm):
@@ -351,7 +456,42 @@ def aggregate(exp, log_dir, out_path=None, window=10, show_floors=True):
             lines.append(f"{arm:<32} {len(a):>3} {a.mean():>9.2f} "
                          f"{a.std(ddof=1) if len(a) > 1 else 0.0:>7.2f} "
                          f"{pct}  [{per}]")
-        if F_V is not None and show_floors:
+        if env_name.startswith("Islands") and show_floors:
+            fl = island_floors(k, cache_path=Path(log_dir) / "oracles.json")
+            lines.append("  -- non-learning reference policies --")
+            for nm, note in (("random", "no policy"),
+                             ("sweep", "F-free serpentine, no state"),
+                             ("dec", "myopic greedy on SHARED set"),
+                             ("plan_self", "nearest island, ignores teammates"),
+                             ("plan", "nearest UNCLAIMED island (oracle)")):
+                lines.append(f"  {nm:<30} {'':>3} {fl[nm]:>9.2f} {'':>7} "
+                             f"{100*fl[nm]/F_V:>6.1f}%  ({note})")
+            lines.append(f"  planning headroom plan-dec = "
+                         f"{100*(fl['plan']-fl['dec'])/F_V:.1f} pts, "
+                         f"assignment headroom plan-plan_self = "
+                         f"{100*(fl['plan']-fl['plan_self'])/F_V:.1f} pts")
+            # Anchor on random -> plan, NOT dec -> plan. `dec`, `plan_self`
+            # and `plan` all call env.F, i.e. they read the demand field
+            # exactly; a model-free learner has to discover it. Anchoring a
+            # learner on dec asks it to beat privileged information and
+            # reports every arm as negative even when the arms separate
+            # cleanly from each other. random -> plan is the span a learner
+            # can actually traverse; dec stays in the table as a reference.
+            span = max(fl["plan"] - fl["random"], 1e-9)
+            base = max((np.mean(list(v.values())) for a, v in by_arm.items()
+                        if a.startswith(("SHARED", "VDN", "QMIX"))),
+                       default=None)
+            lines.append("  -- learned arms, share of the random -> plan "
+                         "span closed --")
+            for arm in sorted(by_arm):
+                a = np.mean(list(by_arm[arm].values()))
+                extra = ""
+                if base is not None and base > fl["random"]:
+                    extra = (f"   ({(a-fl['random'])/(base-fl['random']):.2f}x "
+                             f"the best mixing/team-reward baseline)")
+                lines.append(f"  {arm:<30} "
+                             f"{100*(a-fl['random'])/span:>6.1f}%{extra}")
+        elif F_V is not None and show_floors:
             fl = oracle_floors(k, cache_path=Path(log_dir) / "oracles.json")
             lines.append("  -- non-learning reference policies --")
             for nm, note in (("random", "no policy"),
@@ -401,7 +541,7 @@ def aggregate(exp, log_dir, out_path=None, window=10, show_floors=True):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--exp", choices=["o9", "o10", "o9lr"], default="o9")
+    ap.add_argument("--exp", choices=["o9", "o10", "o9lr", "islands", "islandslr"], default="o9")
     ap.add_argument("--lr", type=float, default=None,
                     help="override the learning rate (default 5e-4)")
     ap.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS)
@@ -423,12 +563,27 @@ if __name__ == "__main__":
 
     exp = args.exp
     log_dir = args.log_dir or LOG_DIR[exp]
-    ks = args.ks or ({"o9": [2, 3, 4, 6, 8], "o9lr": [6]}.get(
-        exp, [2, 3, 4, 6]))
+    ks = args.ks or ({"o9": [2, 3, 4, 6, 8], "o9lr": [6],
+                      "islands": [3, 4, 6],
+                      "islandslr": [6]}.get(exp, [2, 3, 4, 6]))
     seeds = args.seeds
 
     if args.inspect:
         inspect(log_dir)
+        sys.exit(0)
+
+    if args.floors_only and exp.startswith("islands"):
+        print(f"{'k':>3} {'random':>9} {'sweep':>9} {'dec':>9} "
+              f"{'plan_self':>9} {'plan':>9} | {'plan-dec':>9} {'plan-self':>9}")
+        for k in ks:
+            F_V = IslandEnv(k=k, **ISLANDS).max_cells
+            fl = island_floors(k, cache_path=Path(log_dir) / "oracles.json")
+            pc = lambda x: 100 * x / F_V
+            print(f"{k:>3} {pc(fl['random']):>8.1f}% {pc(fl['sweep']):>8.1f}% "
+                  f"{pc(fl['dec']):>8.1f}% {pc(fl['plan_self']):>8.1f}% "
+                  f"{pc(fl['plan']):>8.1f}% | "
+                  f"{pc(fl['plan']-fl['dec']):>8.1f} "
+                  f"{pc(fl['plan']-fl['plan_self']):>8.1f}")
         sys.exit(0)
 
     if args.floors_only:
@@ -452,7 +607,17 @@ if __name__ == "__main__":
     install_facility_credits()
     print("wiring checks passed; facility credits routed to the closed form")
 
-    if args.pilot:
+    if args.pilot and exp.startswith("islands"):
+        ks, seeds = [6], [0]
+        cfg = ISLAND_PILOT_CFG
+        log_dir = args.log_dir or (LOG_DIR["islands"] + "_pilot")
+        print("\nPILOT (islands): k=6, one seed, all five learners, "
+              f"{cfg['n_episodes']} episodes.\n"
+              "Read each arm against the plan-dec gap. If every arm sits "
+              "near `random`, eps=0 is too sparse: retry with eps=0.02 "
+              "(assignment headroom survives that, planning headroom "
+              "does not).")
+    elif args.pilot:
         exp, ks, seeds = "o9", [6], [0]
         cfg = PILOT_CFG
         log_dir = args.log_dir or (LOG_DIR["o9"] + "_pilot")

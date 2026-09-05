@@ -81,7 +81,7 @@ LOG_DIR = {"o9": "logs/macs_facility", "o10": "logs/macs_clipcontrol",
 
 # Learning rates for the O9-LR robustness arm. 5e-4 is the published
 # setting and the one that diverged in the pilot.
-LR_GRID = [5e-4, 2e-4, 1e-4]
+LR_GRID = [5e-4, 2e-4, 1e-4, 5e-5]
 DEFAULT_SEEDS = [0, 1, 2, 3, 4]
 
 # 4000 episodes matches the published saturating runs, so the two suites
@@ -109,14 +109,14 @@ FACILITY = dict(size=24, horizon=60, rho=4.0, patch=0, demand="uniform")
 # layout_seed=0 fixes the map, so no demand input channel is needed.
 ISLANDS = dict(size=24, horizon=30, rho=4.0, n_islands=8, radius=1,
                min_sep=8, eps=0.0, layout_seed=0, depot=True)
-ISLAND_MODES = ("SHARED", "VDN", "QMIX", "MACS", "MACS-CLIP")
+ISLAND_MODES = ("SHARED", "LOCAL", "DR", "VDN", "QMIX",
+                "MACS", "MACS-CLIP")
 # The k=6 pilot flagged VDN and QMIX as diverging at the published 5e-4.
 # A reviewer will read an untuned baseline as a stacked comparison, so
 # `islandslr` reruns the three baselines across the same grid the private
 # arm got in O9-LR. Whatever rate is best per baseline is what the headline
 # table should report.
-ISLANDLR_MODES = ("SHARED", "VDN", "QMIX")
-
+ISLANDLR_MODES = ("SHARED", "LOCAL", "DR", "VDN", "QMIX", "MACS")
 # O10 reuses the exact saturating configurations of the paper's Table 2.
 SATURATING = {2: dict(size=12, horizon=40), 3: dict(size=12, horizon=40),
               4: dict(size=12, horizon=40), 6: dict(size=16, horizon=60)}
@@ -330,9 +330,19 @@ def final_metric(path, window=10):
     return float(np.mean(ev[-window:])), len(ev)
 
 
+CLIP = {}   # {(env_name, k): {arm: [mean clip_frac per seed]}}
+
+
 def collect(log_dir, window=10):
-    """{(env_name, k): {arm: {seed: metric}}}, plus a skip report."""
+    """{(env_name, k): {arm: {seed: metric}}}, plus a skip report.
+
+    Also fills CLIP with mean bootstrap-clip activation per arm. On islands
+    B(S') = F(V) - F(S') stays near 310 while bootstrap values sit near
+    250, so the ceiling never binds and the clipped arm is the same backup
+    as the unclipped one. That has to be printed, not inferred.
+    """
     out, short, n_files = {}, [], 0
+    CLIP.clear()
     for p in sorted(Path(log_dir).glob("*seed*.json")):
         with open(p) as f:
             d = json.load(f)
@@ -347,6 +357,9 @@ def collect(log_dir, window=10):
             arm += f"/lr{c['lr']:g}"
         out.setdefault((c["env_name"], c["k"]), {}) \
            .setdefault(arm, {})[c.get("seed", 0)] = m
+        cf = [x for x in d["per_block"].get("clip_frac", []) if x is not None]
+        CLIP.setdefault((c["env_name"], c["k"]), {}) \
+            .setdefault(arm, []).append(float(np.mean(cf)) if cf else 0.0)
     if short:
         print(f"note: {len(short)} of {n_files} log(s) have fewer than "
               f"{window} evaluation checkpoints and were skipped "
@@ -410,6 +423,25 @@ def inspect(log_dir):
           "an information-limited optimum and should not be read as one.")
 
 
+def resolve_arm(key, by_arm):
+    """Map a COMPARISONS key onto an arm actually present in `by_arm`.
+
+    collect() appends "/lr{rate}" to every arm whose config records one, so
+    the bare keys below never match. With per-method learning rates the two
+    sides of a comparison carry different suffixes, so no single bare key
+    could match both. Resolve by prefix instead.
+
+    Returns the arm name, or None when absent or ambiguous. Ambiguity is
+    real information -- several rates for one method means the sweep has
+    not been reduced to a headline -- so the caller reports it rather than
+    guessing.
+    """
+    if key in by_arm:
+        return key
+    hits = [a for a in by_arm if a == key or a.startswith(key + "/lr")]
+    return hits[0] if len(hits) == 1 else None
+
+
 COMPARISONS = {
     "o9": [("MACS/shared/none", "MACS/private/none",
             "value of the shared augmented state")],
@@ -419,6 +451,10 @@ COMPARISONS = {
                    f"MACS vs team reward at lr={r:g}") for r in LR_GRID],
     "islands": [("MACS/shared/none", "SHARED/shared/none",
                  "Shapley credit vs team reward"),
+                ("MACS/shared/none", "LOCAL/shared/none",
+                 "Shapley credit vs first-arrival marginal"),
+                ("MACS/shared/none", "DR/shared/none",
+                 "Shapley credit vs last-arrival marginal"),
                 ("MACS/shared/none", "VDN/shared/none",
                  "Shapley credit vs additive mixing"),
                 ("MACS/shared/none", "QMIX/shared/none",
@@ -447,15 +483,17 @@ def aggregate(exp, log_dir, out_path=None, window=10, show_floors=True):
         else:
             F_V = None
         lines.append(f"{'arm':<32} {'n':>3} {'mean':>9} {'std':>7} "
-                     f"{'%F(V)':>7}  seeds")
+                     f"{'%F(V)':>7} {'clip':>6}  seeds")
         for arm in sorted(by_arm):
             v = by_arm[arm]
             a = np.array([v[s] for s in sorted(v)])
             per = ", ".join(f"{s}:{v[s]:.1f}" for s in sorted(v))
             pct = f"{100*a.mean()/F_V:>6.1f}%" if F_V else " " * 7
+            cfs = CLIP.get((env_name, k), {}).get(arm, [])
+            cf = f"{np.mean(cfs):>6.3f}" if cfs else " " * 6
             lines.append(f"{arm:<32} {len(a):>3} {a.mean():>9.2f} "
                          f"{a.std(ddof=1) if len(a) > 1 else 0.0:>7.2f} "
-                         f"{pct}  [{per}]")
+                         f"{pct} {cf}  [{per}]")
         if env_name.startswith("Islands") and show_floors:
             fl = island_floors(k, cache_path=Path(log_dir) / "oracles.json")
             lines.append("  -- non-learning reference policies --")
@@ -466,6 +504,17 @@ def aggregate(exp, log_dir, out_path=None, window=10, show_floors=True):
                              ("plan", "nearest UNCLAIMED island (oracle)")):
                 lines.append(f"  {nm:<30} {'':>3} {fl[nm]:>9.2f} {'':>7} "
                              f"{100*fl[nm]/F_V:>6.1f}%  ({note})")
+            for arm in sorted(by_arm):
+                if not arm.startswith("MACS-CLIP"):
+                    continue
+                cfs = CLIP.get((env_name, k), {}).get(arm, [])
+                if cfs and max(cfs) < 1e-9:
+                    lines.append(
+                        "  NOTE: clip activation is identically zero for "
+                        f"{arm}. B(S') never binds on this\n        "
+                        "configuration, so the clipped arm is the SAME "
+                        "backup as MACS and any difference\n        between "
+                        "them is seed noise, not an effect of the clip.")
             lines.append(f"  planning headroom plan-dec = "
                          f"{100*(fl['plan']-fl['dec'])/F_V:.1f} pts, "
                          f"assignment headroom plan-plan_self = "
@@ -478,9 +527,16 @@ def aggregate(exp, log_dir, out_path=None, window=10, show_floors=True):
             # cleanly from each other. random -> plan is the span a learner
             # can actually traverse; dec stays in the table as a reference.
             span = max(fl["plan"] - fl["random"], 1e-9)
-            base = max((np.mean(list(v.values())) for a, v in by_arm.items()
-                        if a.startswith(("SHARED", "VDN", "QMIX"))),
-                       default=None)
+            # Denominator is the best of ALL baselines. Restricting it
+            # to {SHARED, VDN, QMIX} excluded LOCAL and DR, the two arms
+            # most likely to be competitive: in the k=6 smoke DR closed
+            # 33.3% against MACS's 35.8%, so the honest multiplier was
+            # 1.08x while the old denominator printed 1.55x.
+            BASELINES = ("SHARED", "LOCAL", "DR", "VDN", "QMIX")
+            cand = {a: np.mean(list(v.values())) for a, v in by_arm.items()
+                    if a.startswith(BASELINES)}
+            base_arm = max(cand, key=cand.get) if cand else None
+            base = cand[base_arm] if base_arm else None
             lines.append("  -- learned arms, share of the random -> plan "
                          "span closed --")
             for arm in sorted(by_arm):
@@ -488,7 +544,7 @@ def aggregate(exp, log_dir, out_path=None, window=10, show_floors=True):
                 extra = ""
                 if base is not None and base > fl["random"]:
                     extra = (f"   ({(a-fl['random'])/(base-fl['random']):.2f}x "
-                             f"the best mixing/team-reward baseline)")
+                             f"{base_arm.split('/')[0]}, best baseline)")
                 lines.append(f"  {arm:<30} "
                              f"{100*(a-fl['random'])/span:>6.1f}%{extra}")
         elif F_V is not None and show_floors:
@@ -504,11 +560,22 @@ def aggregate(exp, log_dir, out_path=None, window=10, show_floors=True):
                 "  NOTE: a learned arm scoring below `blind` has not found "
                 "an information-limited\n        optimum -- it is doing "
                 "worse than a policy that does no learning at all.")
-        for hi, lo, note in COMPARISONS[exp]:
-            if hi not in by_arm or lo not in by_arm:
+        for hi_key, lo_key, note in COMPARISONS[exp]:
+            hi, lo = resolve_arm(hi_key, by_arm), resolve_arm(lo_key, by_arm)
+            if hi is None or lo is None:
+                for key, got in ((hi_key, hi), (lo_key, lo)):
+                    if got is None and any(a.startswith(key + "/lr")
+                                           for a in by_arm):
+                        lines.append(
+                            f"  SKIPPED {hi_key} vs {lo_key}: several "
+                            f"learning rates present for {key}; aggregate a "
+                            f"log dir holding one rate per method, or name "
+                            f"the rate in COMPARISONS.")
                 continue
             seeds = sorted(set(by_arm[hi]) & set(by_arm[lo]))
             if len(seeds) < 2:
+                lines.append(f"  SKIPPED {hi} vs {lo}: {len(seeds)} shared "
+                             f"seed(s), need 2+ for a permutation test.")
                 continue
             diff, p = exact_perm_test([by_arm[hi][s] for s in seeds],
                                       [by_arm[lo][s] for s in seeds])
@@ -546,6 +613,10 @@ if __name__ == "__main__":
                     help="override the learning rate (default 5e-4)")
     ap.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS)
     ap.add_argument("--ks", type=int, nargs="+", default=None)
+    ap.add_argument("--modes", nargs="+", default=None,
+                    help="restrict the plan to these methods, so a "
+                         "per-method learning rate can be run from "
+                         "one invocation")
     ap.add_argument("--pilot", action="store_true")
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
@@ -638,6 +709,13 @@ if __name__ == "__main__":
               f"Checks whether the private arm's divergence in the pilot is "
               f"intrinsic to the observation or a tuning artifact.")
     rows = plan(exp, ks, seeds, lr=args.lr)
+    if args.modes:
+        want = set(args.modes)
+        unknown = want - {r[2] for r in rows}
+        if unknown:
+            sys.exit(f"--modes: no planned run uses {sorted(unknown)}; "
+                     f"available here: {sorted({r[2] for r in rows})}")
+        rows = [r for r in rows if r[2] in want]
     print(f"\nPlan ({exp}): {len(rows)} runs into {log_dir}")
     for env_name, k, mode, obs, clip, seed, lr, _ in rows:
         print(f"  {label_of(env_name, k, mode, obs, clip, seed, lr)}")

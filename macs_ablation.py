@@ -254,7 +254,13 @@ if TORCH_OK:
                 zs2, frs2 = tracker.channels(z2)
 
                 phi = M.compute_credits(mode, r_team, info, env.F, k, rng=rng)
-                if mode in ("MACS", "MACS-CLIP"):
+                if mode in M.CREDIT_MODES:
+                    # Measured for EVERY credit rule, not just Shapley:
+                    # |sum_i phi_i - r_t| is 0 for Shapley by construction,
+                    # (k-1)*r_t for SHARED, and footprint-overlap dependent
+                    # for LOCAL (over-attributes) and DR (under-attributes).
+                    # Logging it only for MACS made the column read as if
+                    # every rule were efficiency-exact.
                     block_err.append(abs(phi.sum() - r_team))
 
                 bud2 = np.float32(F_total - env.F(env.covered))
@@ -325,7 +331,7 @@ if TORCH_OK:
                                   if block_loss else None)
                 pb["epsilon"].append(round(epsilon, 3))
                 pb["credit_sum_err"].append(
-                    round(float(np.max(block_err)), 8) if block_err else 0.0)
+                    round(float(np.max(block_err)), 8) if block_err else None)
                 pb["clip_frac"].append(round(float(np.mean(block_clip)), 5)
                                        if block_clip else 0.0)
                 print(f"  [{label}] ep {ep_i:5d} | "

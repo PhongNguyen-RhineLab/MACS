@@ -62,6 +62,7 @@ Usage:
 """
 
 import argparse
+import itertools
 import json
 import sys
 from pathlib import Path
@@ -75,6 +76,34 @@ from macs_v3 import SaturatingCoverageEnv
 from macs_ablation import install_facility_credits, run_checks
 from run_multiseed_sat import exact_perm_test, r1
 
+
+def paired_sign_flip_test(a, b, n_max_exact=2 ** 20):
+    """
+    Two-sided exact paired test on the per-seed differences d_s = a_s - b_s.
+
+    The unpaired permutation test throws away the pairing, and on this
+    benchmark the seed is a common random number (depot spawn stream and
+    network init), so most of the between-seed spread is shared by the two
+    arms and cancels in d_s. Enumerating all 2^n sign flips of d is the
+    exact test for the null "the sign of each difference is symmetric",
+    which is what the paired design licenses.
+
+    Resolution limit: the smallest attainable two-sided p is 2/2^n, so
+    n=5 seeds can never reach 0.05 and n>=6 is required for a paired
+    claim at that level. Returns (mean difference, p-value).
+    """
+    d = np.asarray(a, float) - np.asarray(b, float)
+    n = len(d)
+    obs = float(d.mean())
+    if 2 ** n <= n_max_exact:
+        signs = np.array(list(itertools.product([1.0, -1.0], repeat=n)))
+        means = (signs * d).mean(axis=1)
+    else:
+        rng = np.random.default_rng(0)
+        means = (rng.choice([1.0, -1.0], size=(20_000, n)) * d).mean(axis=1)
+    p = float(np.mean(np.abs(means) >= abs(obs) - 1e-12))
+    return obs, p
+
 LOG_DIR = {"o9": "logs/macs_facility", "o10": "logs/macs_clipcontrol",
            "o9lr": "logs/macs_facility_lr", "islands": "logs/macs_islands",
            "islandslr": "logs/macs_islands_lr"}
@@ -82,6 +111,10 @@ LOG_DIR = {"o9": "logs/macs_facility", "o10": "logs/macs_clipcontrol",
 # Learning rates for the O9-LR robustness arm. 5e-4 is the published
 # setting and the one that diverged in the pilot.
 LR_GRID = [5e-4, 2e-4, 1e-4, 5e-5]
+# The islands sweep found 5e-5 best for all six modes, i.e. optimal at the
+# grid EDGE, for the second round running. Extend downward so the selected
+# rate is interior; kept separate from LR_GRID so the o9lr plan is unchanged.
+ISLANDLR_GRID = [5e-4, 2e-4, 1e-4, 5e-5, 2e-5, 1e-5]
 DEFAULT_SEEDS = [0, 1, 2, 3, 4]
 
 # 4000 episodes matches the published saturating runs, so the two suites
@@ -239,7 +272,7 @@ def plan(exp, ks, seeds, lr=None):
         name = f"Islands {ISLANDS['size']}x{ISLANDS['size']}"
         for k in ks:
             for mode in ISLANDLR_MODES:
-                for rate in LR_GRID:
+                for rate in ISLANDLR_GRID:
                     for s in seeds:
                         out.append((name, k, mode, "shared", "none", s, rate,
                                     island_factory(k)))
@@ -394,12 +427,19 @@ def inspect(log_dir):
             d = json.load(f)
         pb = d["per_block"]
         ev = [x for x in pb["eval_coverage"] if x is not None]
-        err = max(pb.get("credit_sum_err") or [0.0])
+        # None entries mean "this mode has no credit rule" (VDN/QMIX);
+        # nan then prints as n/a rather than as a measured zero.
+        errs = [x for x in (pb.get("credit_sum_err") or []) if x is not None]
+        err = max(errs) if errs else float("nan")
         cf = pb.get("clip_frac") or [0.0]
         last10 = np.mean(ev[-10:]) if ev else float("nan")
         rising = (len(ev) >= 4 and
                   np.mean(ev[-2:]) > np.mean(ev[-4:-2]) + 1e-9)
-        flag = "  <-- credit error nonzero" if err > 1e-6 else ""
+        # Only Shapley is efficiency-exact by construction, so only there is
+        # a nonzero value a bug. SHARED/LOCAL/DR are expected to be nonzero.
+        flag = ("  <-- credit error nonzero"
+                if d["config"].get("method") in ("MACS", "MACS-CLIP")
+                and err > 1e-6 else "")
         # divergence: TD loss still climbing over the last third AND
         # evaluation below its own peak. Both together distinguish a
         # diverging run from one that is merely still learning.
@@ -415,8 +455,9 @@ def inspect(log_dir):
                      and last10 < 0.9 * max(ev))
         if diverging:
             flag += "  <-- DIVERGING (loss climbing, eval past peak)"
+        es = "n/a" if err != err else f"{err:.2e}"      # nan -> no credit rule
         print(f"{p.stem[:58]:<58} {len(ev):>6} {last10:>8.2f} "
-              f"{err:>11.2e} {str(rising):>7} {np.mean(cf):>6.3f}{flag}")
+              f"{es:>11} {str(rising):>7} {np.mean(cf):>6.3f}{flag}")
     print("\nrising=True on every arm means the sweep is undertrained; a "
           "null difference there is not evidence of no difference.")
     print("DIVERGING means the run did not converge, so its score is not "
@@ -447,8 +488,19 @@ COMPARISONS = {
             "value of the shared augmented state")],
     "o9lr": [(f"MACS/shared/none/lr{r:g}", f"MACS/private/none/lr{r:g}",
               f"shared vs private at lr={r:g}") for r in LR_GRID],
-    "islandslr": [(f"MACS/shared/none/lr{r:g}", f"SHARED/shared/none/lr{r:g}",
-                   f"MACS vs team reward at lr={r:g}") for r in LR_GRID],
+    # MACS vs SHARED alone cannot support a Shapley-specific claim: LOCAL
+    # and DR are per-agent credit rules too, and the k=6 sweep put them
+    # within 2 and 19 points of MACS. Those are the tests that decide the
+    # paper, so they run at every rate.
+    "islandslr": ([(f"MACS/shared/none/lr{r:g}", f"LOCAL/shared/none/lr{r:g}",
+                    f"Shapley vs first-arrival marginal at lr={r:g}")
+                   for r in ISLANDLR_GRID]
+                  + [(f"MACS/shared/none/lr{r:g}", f"DR/shared/none/lr{r:g}",
+                      f"Shapley vs last-arrival marginal at lr={r:g}")
+                     for r in ISLANDLR_GRID]
+                  + [(f"MACS/shared/none/lr{r:g}", f"SHARED/shared/none/lr{r:g}",
+                      f"MACS vs team reward at lr={r:g}")
+                     for r in ISLANDLR_GRID]),
     "islands": [("MACS/shared/none", "SHARED/shared/none",
                  "Shapley credit vs team reward"),
                 ("MACS/shared/none", "LOCAL/shared/none",
@@ -515,10 +567,15 @@ def aggregate(exp, log_dir, out_path=None, window=10, show_floors=True):
                         "configuration, so the clipped arm is the SAME "
                         "backup as MACS and any difference\n        between "
                         "them is seed noise, not an effect of the clip.")
+            # Units: the arm table above is RAW coverage, these are
+            # percentage points of F(V). Print both so the two cannot be
+            # compared against each other by mistake.
             lines.append(f"  planning headroom plan-dec = "
-                         f"{100*(fl['plan']-fl['dec'])/F_V:.1f} pts, "
+                         f"{fl['plan']-fl['dec']:.1f} raw "
+                         f"({100*(fl['plan']-fl['dec'])/F_V:.1f} pts of F(V)), "
                          f"assignment headroom plan-plan_self = "
-                         f"{100*(fl['plan']-fl['plan_self'])/F_V:.1f} pts")
+                         f"{fl['plan']-fl['plan_self']:.1f} raw "
+                         f"({100*(fl['plan']-fl['plan_self'])/F_V:.1f} pts of F(V))")
             # Anchor on random -> plan, NOT dec -> plan. `dec`, `plan_self`
             # and `plan` all call env.F, i.e. they read the demand field
             # exactly; a model-free learner has to discover it. Anchoring a
@@ -577,11 +634,20 @@ def aggregate(exp, log_dir, out_path=None, window=10, show_floors=True):
                 lines.append(f"  SKIPPED {hi} vs {lo}: {len(seeds)} shared "
                              f"seed(s), need 2+ for a permutation test.")
                 continue
-            diff, p = exact_perm_test([by_arm[hi][s] for s in seeds],
-                                      [by_arm[lo][s] for s in seeds])
+            av = [by_arm[hi][s] for s in seeds]
+            bv = [by_arm[lo][s] for s in seeds]
+            diff, p = exact_perm_test(av, bv)
+            pdiff, pp = paired_sign_flip_test(av, bv)
+            floor = 2.0 / 2 ** len(seeds)
             lines.append(f"  {hi} vs {lo}: diff = {diff:+.2f}, "
                          f"exact permutation p = {p:.4f} "
                          f"(two-sided, n={len(seeds)}+{len(seeds)})  [{note}]")
+            lines.append(f"      paired on seed: mean d = {pdiff:+.2f}, "
+                         f"sign-flip p = {pp:.4f} "
+                         f"(n={len(seeds)} pairs, smallest attainable "
+                         f"p = {floor:.4f})"
+                         + ("  <-- n too small to reach 0.05"
+                            if floor > 0.05 else ""))
     report = "\n".join(lines)
     print(report)
     if out_path:

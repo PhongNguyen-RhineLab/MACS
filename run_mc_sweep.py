@@ -381,12 +381,19 @@ def inspect(log_dir):
             d = json.load(f)
         pb = d["per_block"]
         ev = [x for x in pb["eval_coverage"] if x is not None]
-        err = max(pb.get("credit_sum_err") or [0.0])
+        # None entries mean "this mode has no credit rule" (VDN/QMIX);
+        # nan then prints as n/a rather than as a measured zero.
+        errs = [x for x in (pb.get("credit_sum_err") or []) if x is not None]
+        err = max(errs) if errs else float("nan")
         cf = pb.get("clip_frac") or [0.0]
         last10 = np.mean(ev[-10:]) if ev else float("nan")
         rising = (len(ev) >= 4 and
                   np.mean(ev[-2:]) > np.mean(ev[-4:-2]) + 1e-9)
-        flag = "  <-- credit error nonzero" if err > 1e-6 else ""
+        # Only Shapley is efficiency-exact by construction, so only there is
+        # a nonzero value a bug. SHARED/LOCAL/DR are expected to be nonzero.
+        flag = ("  <-- credit error nonzero"
+                if d["config"].get("method") in ("MACS", "MACS-CLIP")
+                and err > 1e-6 else "")
         # divergence: TD loss still climbing over the last third AND
         # evaluation below its own peak. Both together distinguish a
         # diverging run from one that is merely still learning.
@@ -402,8 +409,9 @@ def inspect(log_dir):
                      and last10 < 0.9 * max(ev))
         if diverging:
             flag += "  <-- DIVERGING (loss climbing, eval past peak)"
+        es = "n/a" if err != err else f"{err:.2e}"      # nan -> no credit rule
         print(f"{p.stem[:58]:<58} {len(ev):>6} {last10:>8.2f} "
-              f"{err:>11.2e} {str(rising):>7} {np.mean(cf):>6.3f}{flag}")
+              f"{es:>11} {str(rising):>7} {np.mean(cf):>6.3f}{flag}")
     print("\nrising=True on every arm means the sweep is undertrained; a "
           "null difference there is not evidence of no difference.")
     print("DIVERGING means the run did not converge, so its score is not "

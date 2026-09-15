@@ -234,6 +234,12 @@ def compute_frontier(z_map):
 # Credit assignment dispatcher
 # =============================================================================
 
+# Modes whose loss consumes a per-agent credit phi_i. Efficiency
+# (sum_i phi_i == r_team) is only DEFINED for these; VDN and QMIX learn
+# from r_team directly and have no credit rule to measure.
+CREDIT_MODES = ("MACS", "MACS-CLIP", "SHARED", "LOCAL", "DR")
+
+
 def compute_credits(mode, r_team, info, F, k, mc_m=0, rng=None):
     """
     Returns phi (k,).
@@ -485,7 +491,7 @@ if TORCH_OK:
                 (pos_n2, z2), r_team, done, info = env.step(acts)
                 fr2 = compute_frontier(z2)
                 phi = compute_credits(mode, r_team, info, env.F, k, rng=rng)
-                if mode in ("MACS", "MACS-CLIP"):
+                if mode in CREDIT_MODES:
                     block_err.append(abs(phi.sum() - r_team))
                 # remaining budget at the NEXT state: B(S') = F(V) - F(S')
                 # (Lemma budget; used to clip the bootstrap, Remark clip-impl)
@@ -628,8 +634,11 @@ if TORCH_OK:
                 pb["loss"].append(round(float(np.mean(block_loss)), 5)
                                   if block_loss else None)
                 pb["epsilon"].append(round(epsilon, 3))
+                # None, not 0.0: an empty list means the mode has no credit
+                # rule, which is not the same as a credit rule with zero
+                # efficiency error. Readers must show it as n/a.
                 pb["credit_sum_err"].append(
-                    round(float(np.max(block_err)), 8) if block_err else 0.0)
+                    round(float(np.max(block_err)), 8) if block_err else None)
                 # fraction of bootstrap values the clip actually cut —
                 # diagnostic for Remark clip-why (expect high early, decaying)
                 pb["clip_frac"].append(

@@ -46,6 +46,8 @@ import macs_main as M
 from macs_main import shapley_exact
 from macs_fl import FacilityCoverageEnv, shapley_facility
 from macs_v3 import SaturatingCoverageEnv
+from macs_fl import IslandEnv
+from probe_islands import make_plan
 from shapley_subset import shapley_subset
 from probe_fl import pol_random, pol_dec, pol_coord
 
@@ -56,6 +58,10 @@ SATURATING = {2: dict(size=12, horizon=40), 3: dict(size=12, horizon=40),
               8: dict(size=16, horizon=60)}
 
 POLICIES = {"dec": pol_dec, "coord": pol_coord, "random": pol_random}
+
+# Same canonical config as run_facility.ISLANDS. H=30 is load-bearing.
+ISLANDS = dict(size=24, horizon=30, rho=4.0, n_islands=8, radius=1,
+               min_sep=8, eps=0.0, layout_seed=0, depot=True)
 
 
 def _credits(env, info, exact_fn):
@@ -86,12 +92,15 @@ def _exact_subset(env, info):
 def rollout(make_env, policy, episodes, seed, exact_fn, check=False):
     iota, iota_over_r, spread, ov = [], [], [], []
     finals = []
+    tot_iota = 0.0
+    tot_r = 0.0
     for e in range(episodes):
         rng = np.random.default_rng(seed * 7919 + e)
         env = make_env(seed * 1000 + e)
         env.reset()
+        pol = policy(env) if getattr(policy, "_per_env", False) else policy
         for _ in range(env.horizon):
-            _, r_team, done, info = env.step(policy(env, rng))
+            _, r_team, done, info = env.step(pol(env, rng))
             if r_team <= 1e-9:
                 continue
             phi, loc, dr, r = _credits(env, info, exact_fn)
@@ -99,6 +108,8 @@ def rollout(make_env, policy, episodes, seed, exact_fn, check=False):
                 assert abs(phi.sum() - r) < 1e-6, "efficiency violated"
                 assert np.all(dr <= phi + 1e-9) and np.all(phi <= loc + 1e-9)
             d = loc - phi                      # iota_i, non-negative
+            tot_iota += float(d.sum())
+            tot_r += float(r)
             iota.extend(d.tolist())
             iota_over_r.extend((d / r).tolist())
             spread.append(float((loc.sum() - dr.sum()) / r))
@@ -119,6 +130,7 @@ def rollout(make_env, policy, episodes, seed, exact_fn, check=False):
         rel_p90=float(np.quantile(b, 0.90)) if b.size else 0.0,
         rel_max=float(b.max()) if b.size else 0.0,
         locdr_spread=float(np.mean(spread)) if spread else 0.0,
+        iota_mass=float(tot_iota / tot_r) if tot_r > 0 else 0.0,
     )
 
 
@@ -151,10 +163,35 @@ def suite_saturating(ks, episodes, seed, check):
     return out
 
 
+def suite_islands(ks, episodes, seed, check):
+    """Credit coupling on the islands benchmark.
+
+    The reference policies matter here in a way they do not on the other
+    suites. plan_self sends every agent to its own nearest island and so
+    piles agents on top of each other; plan claims islands and so spreads
+    them. The learned arms sit near plan_self, so its overlap rate is the
+    figure that bears on whether MACS and LOCAL can differ at all.
+    """
+    P_self = make_plan(coord=False); P_self._per_env = True
+    P_plan = make_plan(coord=True); P_plan._per_env = True
+    pols = dict(POLICIES, plan_self=P_self, plan=P_plan)
+    out = {}
+    for k in ks:
+        def mk(s, k=k):
+            return IslandEnv(k=k, seed=s, **ISLANDS)
+        for name, pol in pols.items():
+            t0 = time.time()
+            out[f"islands|k={k}|{name}"] = rollout(
+                mk, pol, episodes, seed, _exact_facility, check)
+            print(f"  islands k={k} {name:9s} "
+                  f"{time.time() - t0:5.1f}s", flush=True)
+    return out
+
+
 def table(res):
     hdr = (f"{'suite/k/policy':28s} {'steps':>6s} {'ovl%':>6s} "
            f"{'i_mean':>8s} {'i_p90':>7s} {'i_max':>7s} "
-           f"{'i/r_mean':>9s} {'i/r_p90':>8s} {'i/F(V)':>8s} {'loc-dr':>7s}")
+           f"{'i/r_mean':>9s} {'i/r_p90':>8s} {'i/F(V)':>8s} {'loc-dr':>7s} {'i_mass':>7s}")
     print(hdr)
     print("-" * len(hdr))
     for kk, v in res.items():
@@ -162,7 +199,7 @@ def table(res):
               f"{v['iota_mean']:8.4f} {v['iota_p90']:7.4f} "
               f"{v['iota_max']:7.4f} {v['rel_mean']:9.4f} "
               f"{v['rel_p90']:8.4f} "
-              f"{v['iota_mean']/v['F_V']:8.5f} {v['locdr_spread']:7.4f}")
+              f"{v['iota_mean']/v['F_V']:8.5f} {v['locdr_spread']:7.4f} {v['iota_mass']:7.4f}")
 
 
 def main():
@@ -170,7 +207,7 @@ def main():
     ap.add_argument("--episodes", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--suite", default="both",
-                    choices=["both", "facility", "saturating"])
+                    choices=["both", "facility", "saturating", "islands"])
     ap.add_argument("--ks", type=int, nargs="+", default=[2, 3, 4, 6])
     ap.add_argument("--check", action="store_true",
                     help="assert efficiency and DR<=phi<=LOC every step")
@@ -180,6 +217,8 @@ def main():
     res = {}
     if a.suite in ("both", "saturating"):
         res.update(suite_saturating(a.ks, a.episodes, a.seed, a.check))
+    if a.suite == "islands":
+        res.update(suite_islands(a.ks, a.episodes, a.seed, a.check))
     if a.suite in ("both", "facility"):
         res.update(suite_facility(a.ks, a.episodes, a.seed, a.check))
     print()

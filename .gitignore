@@ -1,0 +1,31 @@
+# Run artifacts. Per-run logs and figures are reproducible from the code and
+# the seeds; committing them made the repo 3.5 MB of results that go stale
+# the moment a sweep is rerun.
+#
+# Aggregated summaries are the exception and stay tracked: they are the
+# evidence behind the paper tables, they are small, and regenerating one
+# costs a full sweep.
+logs/**
+!logs/**/
+!logs/**/*summary*.json
+!logs/**/*summary*.txt
+!logs/**/oracles.json
+plots/
+*.png
+*.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store

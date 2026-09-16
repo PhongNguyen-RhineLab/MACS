@@ -1,0 +1,9 @@
+# Training needs torch. Everything else -- the credit rules, the
+# environments, the probes and the whole test suite -- runs on numpy alone,
+# which is deliberate: a probe should be cheap enough to run before
+# committing GPU time.
+numpy>=1.24
+torch>=2.0            # training only
+matplotlib>=3.7       # figures only
+scipy>=1.10           # the `front` policy's distance transform only
+pytest>=7.0           # tests only

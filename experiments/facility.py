@@ -45,6 +45,14 @@ Usage:
   python -m experiments.facility --aggregate --exp islands
   python -m experiments.facility --inspect --exp islands
   python -m experiments.facility --floors-only --exp islands
+  python -m experiments.facility --exp decoy --time-obs --seeds 0 1 2 3 4 5
+  python -m experiments.facility --aggregate --exp decoy --time-obs
+
+DECOY  The herding test (probes/decoy.py picks the configuration).
+    One island carries 3x the demand; horizon 20. Under LOCAL a herd on the
+    decoy is stable (no agent gains by leaving), under Shapley and DR it is
+    not, and herding costs the team ~6 points of F(V) in scripted play. The
+    prediction is MACS > LOCAL here even if LOCAL >= MACS on plain islands.
 """
 
 import argparse
@@ -59,34 +67,45 @@ from macs.rollout import mean_coverage
 from macs.stats import f1
 from macs.sweep import Run, cached_floors
 
-EXPERIMENTS = ("o9", "o9lr", "o10", "islands", "islandslr")
+EXPERIMENTS = ("o9", "o9lr", "o10", "islands", "islandslr", "decoy")
 
 DEFAULT_KS = {"o9": [2, 3, 4, 6, 8], "o9lr": [6],
-              "islands": [3, 4, 6], "islandslr": [6], "o10": [2, 3, 4, 6]}
+              "islands": [3, 4, 6], "islandslr": [6], "o10": [2, 3, 4, 6],
+              "decoy": [6]}
 
 
 # =============================================================================
 # Environment factories
 # =============================================================================
 
+# Every factory takes `seed`, which the trainer derives from the run seed
+# (macs.train.env_seeds). Before this, the environments were built with
+# seed=None, so depot and spawn positions came from OS entropy: a run was not
+# reproducible, and two arms at "seed s" did not see the same spawns, which
+# the paired test assumes.
+
 def facility_factory(k):
-    def make():
-        env = FacilityCoverageEnv(k=k, **CFG.FACILITY)
+    def make(seed=None):
+        env = FacilityCoverageEnv(k=k, **CFG.FACILITY, seed=seed)
         env.rho_hint = CFG.FACILITY["rho"]
         return env
     return make
 
 
-def island_factory(k):
-    def make():
-        env = IslandEnv(k=k, **CFG.ISLANDS)
-        env.rho_hint = CFG.ISLANDS["rho"]
+def island_factory(k, cfg=None):
+    cfg = CFG.ISLANDS if cfg is None else cfg
+
+    def make(seed=None):
+        env = IslandEnv(k=k, **cfg, seed=seed)
+        env.rho_hint = cfg["rho"]
         return env
     return make
 
 
 def saturating_factory(k):
-    return lambda: SaturatingCoverageEnv(**CFG.saturating_cfg(k))
+    def make(seed=None):
+        return SaturatingCoverageEnv(**CFG.saturating_cfg(k), seed=seed)
+    return make
 
 
 # =============================================================================
@@ -111,6 +130,22 @@ def facility_floors(k, episodes=8, seed=0, cache_path=None):
     return cached_floors(("facility", k, episodes, seed), compute, cache_path)
 
 
+def decoy_floors(k, episodes=10, seed=0, cache_path=None):
+    """Value-aware planners: the distance-only ones ignore the decoy."""
+    def compute():
+        def make(e, s):
+            env = IslandEnv(k=k, **CFG.DECOY, seed=s)
+            env.rho_hint = CFG.DECOY["rho"]
+            return env
+        out = {name: mean_coverage(make, pol, episodes, seed)
+               for name, pol in P.DECOY_FLOORS}
+        # aggregate() reads plan / plan_self; point them at the value-aware
+        # versions so the headroom lines mean the right thing here
+        out["plan"], out["plan_self"] = out["plan_v"], out["plan_self_v"]
+        return out
+    return cached_floors(("decoy", k, episodes, seed), compute, cache_path)
+
+
 def island_floors(k, episodes=10, seed=0, cache_path=None):
     def compute():
         def make(e, s):
@@ -126,7 +161,39 @@ def island_floors(k, episodes=10, seed=0, cache_path=None):
 # Plans
 # =============================================================================
 
-def plan(exp, ks, seeds, lr=None, modes=None):
+def plan(exp, ks, seeds, lr=None, modes=None, time_obs=False):
+    runs = _plan(exp, ks, seeds, lr=lr, modes=modes)
+    if not time_obs:
+        return runs
+    import dataclasses
+    runs = [dataclasses.replace(r, time_obs=True) for r in runs]
+    if exp == "islands" and (modes is None or "MACS-CLIP" in modes):
+        # The reach clip needs tau, so it only exists on time-aware runs. It
+        # sits beside the budget arm rather than replacing it: the pair is
+        # the direct test of whether the tighter per-agent ceiling matters.
+        name = CFG.env_name("islands")
+        for k in ks:
+            for s in seeds:
+                runs.append(Run(name, k, "MACS-CLIP", s, "shared", "reach",
+                                lr, island_factory(k), time_obs=True))
+    return runs
+
+
+def comparisons(exp, time_obs=False):
+    """COMPARISONS[exp], re-keyed to the time-aware arms when asked."""
+    comps = COMPARISONS[exp]
+    if not time_obs:
+        return comps
+    comps = [(a + "/tau", b + "/tau", what) for a, b, what in comps]
+    if exp == "islands":
+        comps += [("MACS-CLIP/shared/reach/tau", "MACS-CLIP/shared/budget/tau",
+                   "per-agent reach ceiling vs team budget ceiling"),
+                  ("MACS-CLIP/shared/reach/tau", "LOCAL/shared/none/tau",
+                   "reach-clipped Shapley vs first-arrival marginal")]
+    return comps
+
+
+def _plan(exp, ks, seeds, lr=None, modes=None):
     runs = []
 
     def keep(m):
@@ -165,6 +232,13 @@ def plan(exp, ks, seeds, lr=None, modes=None):
                 for s in seeds:
                     runs.append(Run(name, k, mode, s, "shared", clip, lr,
                                     island_factory(k)))
+    elif exp == "decoy":
+        name = CFG.env_name("decoy")
+        for k in ks:
+            for mode in filter(keep, CFG.DECOY_MODES):
+                for s in seeds:
+                    runs.append(Run(name, k, mode, s, "shared", "none", lr,
+                                    island_factory(k, CFG.DECOY)))
     elif exp == "o10":
         for k in ks:
             name = CFG.env_name("saturating", k)
@@ -208,6 +282,10 @@ COMPARISONS = {
                  "Shapley credit vs monotone mixing"),
                 ("MACS-CLIP/shared/budget", "MACS/shared/none",
                  "budget clip on top of Shapley")],
+    "decoy": [("MACS/shared/none", "LOCAL/shared/none",
+               "Shapley vs first-arrival marginal under a herding incentive"),
+              ("MACS/shared/none", "DR/shared/none",
+               "Shapley vs last-arrival marginal under a herding incentive")],
     "o10": [("MACS-CLIP/shared/budget", "MACS-CLIP/shared/const",
              "state-dependent vs constant ceiling"),
             ("MACS-CLIP/shared/budget", "MACS/shared/none",
@@ -249,6 +327,11 @@ def main(argv=None):
     ap.add_argument("--log-dir", default=None)
     ap.add_argument("--window", type=int, default=10,
                     help="evaluation checkpoints averaged per seed")
+    ap.add_argument("--time-obs", action="store_true",
+                    help="feed time-to-go tau/T to every network; on "
+                         "islands this also adds the MACS-CLIP reach arm. "
+                         "Labels get a _tau suffix, so these runs never "
+                         "collide with the published logs.")
     ap.add_argument("--unpaired", action="store_true",
                     help="use the unpaired permutation test instead of the "
                          "paired sign-flip test")
@@ -265,13 +348,15 @@ def main(argv=None):
 
     if args.floors_only:
         cache = Path(log_dir) / "oracles.json"
-        if exp.startswith("islands"):
+        if exp.startswith("islands") or exp == "decoy":
+            fl_fn = decoy_floors if exp == "decoy" else island_floors
+            env_cfg = CFG.DECOY if exp == "decoy" else CFG.ISLANDS
             print(f"{'k':>3} {'random':>9} {'sweep':>9} {'dec':>9} "
                   f"{'plan_self':>10} {'plan':>9} | {'plan-dec':>9} "
                   f"{'plan-self':>10}")
             for k in ks:
-                F_V = IslandEnv(k=k, **CFG.ISLANDS).max_cells
-                fl = island_floors(k, cache_path=cache)
+                F_V = IslandEnv(k=k, **env_cfg).max_cells
+                fl = fl_fn(k, cache_path=cache)
                 def pc(x):
                     return 100 * x / F_V
                 print(f"{k:>3} {pc(fl['random']):>8.1f}% "
@@ -296,13 +381,16 @@ def main(argv=None):
 
     if args.aggregate:
         floors = None
-        if exp.startswith("islands"):
+        if exp == "decoy":
+            floors = lambda k: decoy_floors(
+                k, cache_path=Path(log_dir) / "oracles.json")
+        elif exp.startswith("islands"):
             floors = lambda k: island_floors(
                 k, cache_path=Path(log_dir) / "oracles.json")
         elif exp in ("o9", "o9lr"):
             floors = lambda k: facility_floors(
                 k, cache_path=Path(log_dir) / "oracles.json")
-        sweep.aggregate(COMPARISONS[exp], log_dir, window=args.window,
+        sweep.aggregate(comparisons(exp, args.time_obs), log_dir, window=args.window,
                         floors=floors, paired=not args.unpaired,
                         out_path=Path(log_dir) / f"{exp}_summary.txt")
         return 0
@@ -326,7 +414,8 @@ def main(argv=None):
         seeds = seeds[:1]
         log_dir = args.log_dir or (log_dir + "_smoke")
 
-    runs = plan(exp, ks, seeds, lr=args.lr, modes=args.modes)
+    runs = plan(exp, ks, seeds, lr=args.lr, modes=args.modes,
+                time_obs=args.time_obs)
     print(f"\n{exp}: {len(runs)} run(s), ks={ks}, seeds={seeds}, "
           f"log_dir={log_dir}")
     sweep.execute(runs, cfg, log_dir, dry_run=args.dry_run,

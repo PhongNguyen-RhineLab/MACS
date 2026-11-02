@@ -19,13 +19,19 @@ through int8, which is lossless for every map value the environments emit.
 Axes:
   mode      MACS | MACS-CLIP | MACS-MC | SHARED | LOCAL | DR | VDN | QMIX
   obs_mode  shared | private                       (O9)
-  clip      none | budget | const                  (O10)
+  clip      none | budget | const | reach          (O10)
+  time_obs  False | True     tau/T fed to every network
   backend   auto | facility | permutation | subset | mc   (Shapley backend)
 
 The budget clip replaces the bootstrap with min(boot, ceiling):
   budget  ceiling = B(S') = F(V) - F(S')   state-dependent (Lemma `budget`)
   const   ceiling = c, the mean of B(S') over the warmup window, then
           frozen -- the state-INDEPENDENT control for O10
+  reach   ceiling = B_i(s'^i, S', tau') per agent (macs.budget), plus a
+          floor at 0 -- both hold for every policy since credits lie in
+          [0, phi^LOC]. Requires time_obs=True: the ceiling varies with tau,
+          and a network that cannot see tau would be fitting a target it
+          cannot represent.
 Sound by Prop. `Clipping is sound`: same fixed point, same contraction,
 iterates confined to the feasible region after one application.
 
@@ -40,13 +46,47 @@ from pathlib import Path
 
 import numpy as np
 
+from macs import budget as BUD
 from macs import credits as C
 from macs import nets as N
 from macs import shapley
 from macs.obs import ObsTracker
 from macs.runlog import RunLog
 
-CLIP_MODES = ("none", "budget", "const")
+CLIP_MODES = ("none", "budget", "const", "reach")
+
+
+# Environment seeds derived from the run seed. Training uses one env for the
+# whole run, so its spawn sequence is fixed by TRAIN; evaluation episode j
+# gets EVAL + j at EVERY checkpoint, so all checkpoints of all arms at one
+# run seed are scored on the same spawns -- common random numbers, which is
+# what makes the paired sign-flip test pair like with like.
+ENV_SEED_TRAIN = 1_000
+ENV_SEED_EVAL = 1_000_000
+
+
+def env_seeds(seed, n_eval):
+    """(training env seed, [eval env seed per episode]) for a run seed."""
+    base = seed * 10_000
+    return (base + ENV_SEED_TRAIN,
+            [ENV_SEED_EVAL + base + j for j in range(n_eval)])
+
+
+def _accepts_seed(factory):
+    import inspect
+    try:
+        return "seed" in inspect.signature(factory).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _make_env(factory, seed):
+    """
+    Call `factory(seed=seed)` when the factory takes a seed, else
+    `factory()`. Factories that ignore the run seed (bare lambdas in tests,
+    o9_parallel's per-call generator) keep working unchanged.
+    """
+    return factory(seed=seed) if _accepts_seed(factory) else factory()
 
 
 def _default_clip(mode):
@@ -63,6 +103,7 @@ def train(
     target_every=50, eval_every=100, n_eval=8,
     label=None, log_dir="logs/macs", log_every=100, seed=0,
     grad_clip=5.0, diag=False, diag_episodes=32, credit_fn=None,
+    time_obs=False, reach_discounted=True,
 ):
     """Train one arm and write its log. Returns the log dict."""
     # Dependency injection rather than module mutation: the scalability
@@ -84,9 +125,13 @@ def train(
             raise ValueError(
                 f"{mode} is the unclipped decomposition-by-architecture "
                 "baseline; clipping it would confound the O10 comparison.")
-    if clip == "budget" and obs_mode == "private":
+    if clip == "reach" and not time_obs:
         raise ValueError(
-            "clip='budget' needs B(S') from the shared set, which a "
+            "clip='reach' uses a ceiling that depends on the time-to-go "
+            "tau; pass time_obs=True so the network can represent it.")
+    if clip in ("budget", "reach") and obs_mode == "private":
+        raise ValueError(
+            f"clip={clip!r} needs the budget from the shared set, which a "
             "private-observation agent cannot see. Use clip='none' for the "
             "O9 ablation so the observation is the only difference.")
 
@@ -97,11 +142,13 @@ def train(
     import torch.nn as nn
     import torch.optim as optim
 
-    env = env_factory()
+    seeded = _accepts_seed(env_factory)
+    train_seed, eval_seeds = env_seeds(seed, n_eval)
+    env = _make_env(env_factory, train_seed)
     k, size, H = env.k, env.size, env.horizon
     if label is None:
         label = (f"{env_name.replace(' ', '_')}_k{k}_{mode}"
-                 f"_{obs_mode}_clip-{clip}")
+                 f"_{obs_mode}_clip-{clip}" + ("_tau" if time_obs else ""))
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
 
@@ -109,8 +156,10 @@ def train(
     resolved_backend = (shapley.resolve(env.F, k, backend)
                         if mode in C.SHAPLEY_MODES else None)
 
-    nets = [N.AgentQNet(size).to(N.DEVICE) for _ in range(k)]
-    targets = [N.AgentQNet(size).to(N.DEVICE) for _ in range(k)]
+    nets = [N.AgentQNet(size, time_input=time_obs).to(N.DEVICE)
+            for _ in range(k)]
+    targets = [N.AgentQNet(size, time_input=time_obs).to(N.DEVICE)
+               for _ in range(k)]
     for q, qt in zip(nets, targets):
         qt.load_state_dict(q.state_dict())
         for p in qt.parameters():
@@ -119,8 +168,8 @@ def train(
 
     mixer = target_mixer = mix_opt = None
     if mode == "QMIX":
-        mixer = N.QMixer(k, size).to(N.DEVICE)
-        target_mixer = N.QMixer(k, size).to(N.DEVICE)
+        mixer = N.QMixer(k, size, time_input=time_obs).to(N.DEVICE)
+        target_mixer = N.QMixer(k, size, time_input=time_obs).to(N.DEVICE)
         target_mixer.load_state_dict(mixer.state_dict())
         for p in target_mixer.parameters():
             p.requires_grad_(False)
@@ -136,10 +185,14 @@ def train(
         batch_size=batch_size, F_total=F_total,
         shapley_backend=resolved_backend,
         mc_m=(mc_m if resolved_backend == "mc" else None),
+        time_obs=time_obs,
+        env_seeds=(dict(train=train_seed, eval=eval_seeds) if seeded
+                   else None),
+        reach_discounted=(reach_discounted if clip == "reach" else None),
     ), log_dir=log_dir)
 
     print(f"\n{'=' * 66}\n  {label}\n  k={k} size={size} H={H} mode={mode} "
-          f"obs={obs_mode} clip={clip}"
+          f"obs={obs_mode} clip={clip} tau={time_obs}"
           + (f" shapley={resolved_backend}" if resolved_backend else "")
           + f"\n{'=' * 66}")
 
@@ -147,9 +200,15 @@ def train(
     eval_cov_last = 0.0
 
     # -- acting ------------------------------------------------------------
-    def greedy_actions(pos_n, zs, frs, epsilon, nets_=None):
+    def tau_of(e):
+        """Normalized time-to-go at the environment's current state."""
+        return np.float32((e.horizon - e.steps) / e.horizon)
+
+    def greedy_actions(pos_n, zs, frs, epsilon, tau=None, nets_=None):
         nets_ = nets_ or nets
         acts = np.zeros(k, dtype=np.int64)
+        tt = (torch.full((1,), float(tau), device=N.DEVICE)
+              if time_obs else None)
         pt = torch.tensor(pos_n, dtype=torch.float32, device=N.DEVICE)
         zt = torch.tensor(zs, dtype=torch.float32, device=N.DEVICE)
         ft = torch.tensor(frs, dtype=torch.float32, device=N.DEVICE)
@@ -160,24 +219,42 @@ def train(
                     acts[i] = rng.integers(env.n_actions)
                 else:
                     q = nets_[i](pt[i:i + 1], zt[i:i + 1], ft[i:i + 1],
-                                 pm[i:i + 1])
+                                 pm[i:i + 1], tt)
                     acts[i] = int(q.argmax())
         return acts
 
+    # Coupling mass on the GREEDY policy, kappa = sum(phi_LOC - phi_Shapley)
+    # / sum(r): how much LOCAL would over-pay on the behaviour this arm
+    # actually learned. High kappa means agents arrive on overlapping
+    # footprints together -- herding. Computed for every arm, so the decoy
+    # comparison can show WHY LOCAL and MACS differ, not just that they do.
+    # A private RNG: a Monte Carlo backend must not touch the training
+    # stream, or the run would stop reproducing.
+    kappa_rng = np.random.default_rng(0x6B617070)
+
     def run_eval():
         covs = []
-        for _ in range(n_eval):
-            e = env_factory()
+        over = team = 0.0
+        for j in range(n_eval):
+            e = _make_env(env_factory, eval_seeds[j])
             (pn, z) = e.reset()
             tr = ObsTracker(e, obs_mode)
             zs, frs = tr.channels(z)
             done = False
             while not done:
-                a = greedy_actions(pn, zs, frs, 0.0)
-                (pn, z), _, done, _ = e.step(a)
+                a = greedy_actions(pn, zs, frs, 0.0, tau_of(e))
+                (pn, z), r_e, done, info_e = e.step(a)
+                if r_e > 0:
+                    loc = C.compute_credits("LOCAL", r_e, info_e, e.F, k)
+                    shp = C.compute_credits("MACS", r_e, info_e, e.F, k,
+                                            backend=backend, mc_m=mc_m,
+                                            rng=kappa_rng)
+                    over += float(np.sum(loc) - np.sum(shp))
+                    team += r_e
                 tr.update()
                 zs, frs = tr.channels(z)
             covs.append(e.total_coverage)
+        block["eval_kappa"].append(over / team if team > 0 else 0.0)
         return float(np.mean(covs))
 
     # -- batch helpers -----------------------------------------------------
@@ -185,10 +262,10 @@ def train(
         return torch.tensor(np.stack([b[j] for b in batch]), dtype=dtype,
                             device=N.DEVICE)
 
-    def agent_q(net, bp, bz, bf, i, actions=None):
+    def agent_q(net, bp, bz, bf, i, actions=None, btau=None):
         """Q_i over the batch; gathered at `actions` if given, else max."""
         pm = N.pos_maps(bp[:, i], size, N.DEVICE)
-        q = net(bp[:, i], bz[:, i], bf[:, i], pm)
+        q = net(bp[:, i], bz[:, i], bf[:, i], pm, btau)
         if actions is None:
             return q.max(1).values
         return q.gather(1, actions[:, i:i + 1]).squeeze(1)
@@ -215,13 +292,16 @@ def train(
         ba = stack(batch, 3, torch.long)
         bphi, br = stack(batch, 4), stack(batch, 5)
         bp2, bz2, bf2 = stack(batch, 6), stack(batch, 7), stack(batch, 8)
-        bd, bbud = stack(batch, 9), stack(batch, 10)
+        bd, bbud = stack(batch, 9), stack(batch, 10)        # bbud (B, k)
+        bt, bt2 = ((stack(batch, 11), stack(batch, 12)) if time_obs
+                   else (None, None))
 
         if mode == "VDN":
             # Q_tot = sum_i Q_i, single TD loss on the team reward.
-            q_sum = sum(agent_q(nets[i], bp, bz, bf, i, ba) for i in range(k))
+            q_sum = sum(agent_q(nets[i], bp, bz, bf, i, ba, bt)
+                        for i in range(k))
             with torch.no_grad():
-                y_sum = sum(agent_q(targets[i], bp2, bz2, bf2, i)
+                y_sum = sum(agent_q(targets[i], bp2, bz2, bf2, i, None, bt2)
                             for i in range(k))
                 y = br + gamma * (1 - bd) * y_sum
             loss = nn.functional.mse_loss(q_sum, y)
@@ -233,14 +313,15 @@ def train(
             # argmaxes, so the target mixes each target net's per-agent max.
             pm_all = N.pos_maps_all(bp, size, N.DEVICE)
             pm_all2 = N.pos_maps_all(bp2, size, N.DEVICE)
-            q_list = [agent_q(nets[i], bp, bz, bf, i, ba) for i in range(k)]
+            q_list = [agent_q(nets[i], bp, bz, bf, i, ba, bt)
+                      for i in range(k)]
             q_tot = mixer(torch.stack(q_list, dim=1),
-                          bz[:, 0], bf[:, 0], pm_all)
+                          bz[:, 0], bf[:, 0], pm_all, bt)
             with torch.no_grad():
-                y_list = [agent_q(targets[i], bp2, bz2, bf2, i)
+                y_list = [agent_q(targets[i], bp2, bz2, bf2, i, None, bt2)
                           for i in range(k)]
                 y_tot = target_mixer(torch.stack(y_list, dim=1),
-                                     bz2[:, 0], bf2[:, 0], pm_all2)
+                                     bz2[:, 0], bf2[:, 0], pm_all2, bt2)
                 y = br + gamma * (1 - bd) * y_tot
             loss = nn.functional.mse_loss(q_tot, y)
             step_optimizers(loss, extra=(mix_opt,))
@@ -249,14 +330,18 @@ def train(
         # independent per-agent TD with credit phi_i (Alg. 2)
         losses = []
         for i in range(k):
-            qi = agent_q(nets[i], bp, bz, bf, i, ba)
+            qi = agent_q(nets[i], bp, bz, bf, i, ba, bt)
             with torch.no_grad():
-                boot = agent_q(targets[i], bp2, bz2, bf2, i)
+                boot = agent_q(targets[i], bp2, bz2, bf2, i, None, bt2)
                 if clip != "none":
-                    ceil = (bbud if clip == "budget"
+                    ceil = (bbud[:, i] if clip in ("budget", "reach")
                             else torch.full_like(boot, const_c))
                     block["clip"].append((boot > ceil).float().mean().item())
                     boot = torch.minimum(boot, ceil)
+                if clip == "reach":
+                    # credits are >= 0 by monotonicity, so is every q_i^pi
+                    block["floor"].append((boot < 0).float().mean().item())
+                    boot = torch.clamp(boot, min=0.0)
                 yi = bphi[:, i] + gamma * (1 - bd) * boot
             li = nn.functional.mse_loss(qi, yi)
             opts[i].zero_grad()
@@ -274,9 +359,10 @@ def train(
         (pos_n, z) = env.reset()
         tracker = ObsTracker(env, obs_mode)
         zs, frs = tracker.channels(z)
+        tau = tau_of(env)
         done = False
         while not done:
-            acts = greedy_actions(pos_n, zs, frs, epsilon)
+            acts = greedy_actions(pos_n, zs, frs, epsilon, tau)
             (pos_n2, z2), r_team, done, info = env.step(acts)
             tracker.update()
             zs2, frs2 = tracker.channels(z2)
@@ -289,15 +375,26 @@ def train(
                 # overlap-dependent for LOCAL and DR.
                 block["err"].append(C.efficiency_error(phi, r_team))
 
-            # remaining budget at the NEXT state: B(S') = F(V) - F(S')
-            bud2 = np.float32(F_total - env.F(env.covered))
+            # ceiling at the NEXT state, one entry per agent:
+            #   budget/const  B(S') = F(V) - F(S'), the same for every agent
+            #   reach         B_i(s'^i, S', tau'), macs.budget
+            team_bud2 = np.float32(F_total - env.F(env.covered))
+            if clip == "reach":
+                bud2 = BUD.reach_budgets(env, gamma,
+                                         discounted=reach_discounted)
+                block["reach_ratio"].append(
+                    float(np.mean(bud2)) / max(float(team_bud2), 1e-9))
+            else:
+                bud2 = np.full(k, team_bud2, dtype=np.float32)
             if clip == "const" and const_c is None:
-                const_acc.append(float(bud2))
+                const_acc.append(float(team_bud2))
+            tau2 = tau_of(env)
 
             buf.push((pos_n.copy(), zs, frs, acts.copy(),
                       phi.astype(np.float32), np.float32(r_team),
-                      pos_n2.copy(), zs2, frs2, np.float32(done), bud2))
-            pos_n, zs, frs = pos_n2, zs2, frs2
+                      pos_n2.copy(), zs2, frs2, np.float32(done), bud2,
+                      tau, tau2))
+            pos_n, zs, frs, tau = pos_n2, zs2, frs2, tau2
 
             if len(buf) >= warmup:
                 if clip == "const" and const_c is None:

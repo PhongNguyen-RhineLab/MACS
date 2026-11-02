@@ -330,6 +330,95 @@ plan_greedy = island_planner(coord_claims=True, local_greedy=True)
 
 
 # =============================================================================
+# Value-aware island planners (for unequal island weights, e.g. the decoy)
+# =============================================================================
+#
+# The planners above rank islands by distance alone, which is right when
+# every island carries the same demand and wrong when one carries more. These
+# rank by discounted remaining value
+#
+#     score_i(c) = gamma^{L1(s^i, centre_c)} * [F(S u {centre_c}) - F(S)],
+#
+# the value agent i would collect by walking to island c and standing on it,
+# if nobody else did. With equal weights and fresh islands this is the
+# nearest-island rule again.
+#
+# Targets are COMMITTED: an agent keeps its island until that island is
+# finished. Without commitment the planner dithers -- at gamma = 0.99 a 1%
+# drop in an island's value, from a trail passing within kernel range,
+# outweighs a step of distance and flips the argmax, and the team wanders
+# (measured: 57.9% of F(V) against 88.8% for the distance planner on the
+# unweighted benchmark). The distance planner commits implicitly, because
+# nearest-island is stable as an agent approaches.
+
+def island_values(env):
+    """Remaining one-shot value of standing on each island centre."""
+    S = env.covered
+    f0 = env.F(S)
+    vals = np.zeros(len(env.Ffl.centres))
+    for c, (cx, cy) in enumerate(env.Ffl.centres):
+        vals[c] = env.F(S | env._patch_mask((int(cx), int(cy)))) - f0
+    return vals
+
+
+def _value_target(env, i, vals, avail, gamma):
+    d = np.abs(env.Ffl.centres - env.pos[i]).sum(1)
+    score = np.where(avail, gamma ** d * vals, -np.inf)
+    return int(np.argmax(score))
+
+
+def value_planner(coord_claims=True, gamma=0.99, assigned=None):
+    """
+    coord_claims=True   shared claim list: `plan_v`, the assignment oracle
+    coord_claims=False  every agent takes its own best island: `plan_self_v`
+    assigned            optional list, agent i -> island index (or None).
+                        An assigned agent walks to its island until that
+                        island is finished, then falls back to the planner.
+                        Scripted strategies for the equilibrium probe
+                        (probes/decoy.py); None everywhere is plain planning.
+    """
+    def make(env):
+        if not hasattr(getattr(env, "Ffl", None), "centres"):
+            raise TypeError("value planners need an IslandEnv")
+        # live[i]: agent i's committed island, or None. Scripted
+        # assignments are just pre-seeded commitments.
+        live = list(assigned) if assigned is not None else [None] * env.k
+
+        def pol(env, rng):
+            n_isl = len(env.Ffl.centres)
+            done = np.array([island_done(env, c) for c in range(n_isl)])
+            for i in range(env.k):
+                if live[i] is not None and done[live[i]]:
+                    live[i] = None                     # job done, re-plan
+            claimed = np.zeros(n_isl, dtype=bool)
+            if coord_claims:
+                for c in live:
+                    if c is not None:
+                        claimed[c] = True
+            vals = None
+            acts = np.full(env.k, 4, dtype=np.int64)
+            for i in range(env.k):
+                if live[i] is None:
+                    if vals is None:
+                        vals = island_values(env)
+                    avail = ~done & (~claimed if coord_claims else True)
+                    if not avail.any():
+                        avail = ~done if (~done).any() else np.ones(n_isl,
+                                                                     bool)
+                    live[i] = _value_target(env, i, vals, avail, gamma)
+                    if coord_claims:
+                        claimed[live[i]] = True
+                acts[i] = step_toward(env, i, env.Ffl.centres[live[i]])
+            return acts
+        return pol
+    return make
+
+
+plan_v = value_planner(coord_claims=True)
+plan_self_v = value_planner(coord_claims=False)
+
+
+# =============================================================================
 # Named sets
 # =============================================================================
 
@@ -345,9 +434,15 @@ ISLAND_FLOORS = (("random", random_policy), ("sweep", sweep), ("dec", dec),
 LADDER = (("random", random_policy), ("blind", blind), ("dec_est", dec_est),
           ("dec", dec), ("coord", coord))
 
+#: floors for weighted islands (the decoy variant): the value-aware planners
+#: replace the distance-only ones, which ignore the decoy's weight
+DECOY_FLOORS = (("random", random_policy), ("sweep", sweep), ("dec", dec),
+                ("plan_self_v", plan_self_v), ("plan_v", plan_v))
+
 #: every island policy, including the ones that are not reported as floors
 ISLAND_LADDER = (("random", random_policy), ("sweep", sweep), ("dec", dec),
                  ("coord", coord), ("plan_self", plan_self), ("plan", plan),
-                 ("plan+g", plan_greedy))
+                 ("plan+g", plan_greedy), ("plan_self_v", plan_self_v),
+                 ("plan_v", plan_v))
 
 BY_NAME = dict((*LADDER, *ISLAND_LADDER, ("front", front)))

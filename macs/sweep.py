@@ -40,6 +40,9 @@ class Run:
     #: clip modes, and its logs on disk carry the short form; changing the
     #: label would make every completed run look incomplete and rerun it.
     compact: bool = False
+    #: feed tau/T to every network (macs.train time_obs). Off by default so
+    #: every existing label, and therefore every completed log, is unchanged.
+    time_obs: bool = False
 
     @property
     def label(self):
@@ -49,6 +52,8 @@ class Run:
         base = f"{stem}_{self.obs_mode}_clip-{self.clip}"
         if self.lr is not None:
             base += f"_lr{self.lr:g}"
+        if self.time_obs:
+            base += "_tau"
         return f"{base}_seed{self.seed}"
 
     @property
@@ -56,6 +61,8 @@ class Run:
         arm = f"{self.mode}/{self.obs_mode}/{self.clip}"
         if self.lr is not None:
             arm += f"/lr{self.lr:g}"
+        if self.time_obs:
+            arm += "/tau"
         return arm
 
 
@@ -81,6 +88,7 @@ def execute(runs, cfg, log_dir, dry_run=False, **train_kw):
             kw["lr"] = r.lr
         train(r.factory, env_name=r.env_name, mode=r.mode,
               obs_mode=r.obs_mode, clip=r.clip, seed=r.seed,
+              time_obs=r.time_obs,
               label=r.label, log_dir=log_dir, **kw, **train_kw)
         done += 1
     if not dry_run:
@@ -131,7 +139,7 @@ def inspect(log_dir):
         rising = (len(ev) >= 4 and
                   np.mean(ev[-2:]) > np.mean(ev[-4:-2]) + 1e-9)
         flag = ("  <-- credit error nonzero"
-                if d["config"].get("method") in ("MACS", "MACS-CLIP")
+                if d["config"].get("method") in ("MACS", "MACS-CLIP", "MACS-MC")
                 and err > 1e-6 else "")
         ls = [x for x in (pb.get("loss") or []) if x is not None]
         mid = len(ls) // 2

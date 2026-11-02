@@ -62,6 +62,78 @@ tests/
 
 For submodular `F`, per agent and per step: `DR <= Shapley <= LOCAL`.
 
+## Time-to-go and the reach clip
+
+`train(..., time_obs=True)` feeds the normalized time-to-go `tau/T` to every
+network (agent nets and the QMIX mixer), so the value class is
+`q_i(s^i, S, tau, a^i)`. The horizon is finite and the bootstrap is
+done-masked, so without `tau` the network is asked to fit one value to
+states that differ only in time remaining. `time_obs=False` is the default
+and reproduces every published run bit for bit.
+
+`clip="reach"` (requires `time_obs=True`, shared observation) replaces the
+team ceiling `B(S') = F(V) - F(S')` with a per-agent ceiling
+
+```
+B_i(s^i, S, tau) = sum_{j=1..tau} gamma^(j-1) [H(j) - H(j-1)],
+H(j) = F(S u R_i(j)) - F(S),  R_i(j) = footprints reachable in j steps
+```
+
+and floors the bootstrap at 0. Both bounds hold for every joint policy, so
+the fixed point is unchanged; `B_i <= B(S)` always. See `macs/budget.py`
+for the proof sketch and `tests/test_budget.py` for the pathwise check.
+Logged per block: `clip_frac`, `floor_frac`, and `reach_ratio`
+(mean `B_i / B(S')`).
+
+```bash
+python -m experiments.facility --exp islands --time-obs --ks 3 4 6
+python -m experiments.facility --aggregate --exp islands --time-obs
+```
+
+With `--time-obs` every label gets a `_tau` suffix, so these runs never
+collide with existing logs, and the islands plan gains a
+`MACS-CLIP/shared/reach/tau` arm beside the budget arm.
+
+## Seeding
+
+Every experiment factory takes `seed`, and the trainer derives it from the
+run seed (`macs.train.env_seeds`): one seed for the training environment,
+and a fixed seed per evaluation episode that is the same at every checkpoint
+and for every arm. Two arms at run seed `s` therefore train on the same
+spawn sequence and are scored on the same spawns, which is what the paired
+sign-flip test assumes. Factories without a `seed` parameter (bare lambdas,
+`o9_parallel`'s per-call generator) are called as before.
+
+Earlier island and facility runs built the environment with `seed=None`, so
+their spawns came from OS entropy and are not reproducible.
+`experiments/saturating.py` and `experiments/scalability.py` still do this,
+on purpose, so their published compact-label runs keep their meaning.
+
+## Decoy islands
+
+`IslandEnv(decoy_mult=m)` gives the island nearest the grid centre `m` times
+the demand of each other island (`m = 1` is the original benchmark, bit for
+bit); `depot_at=(x, y)` fixes the spawn block. `macs.config.DECOY` is the
+islands layout with `m = 3` and horizon 20, chosen by
+
+```bash
+python -m probes.decoy --mults 1 1.5 2 3 --horizon 20
+```
+
+which reports headroom, coupling mass, and, per credit rule, whether one
+agent gains by leaving a herd on the decoy. At the chosen configuration the
+herd is stable under LOCAL and not under Shapley or DR, and it costs the
+team about 6 points of F(V) in scripted play.
+
+```bash
+python -m experiments.facility --exp decoy --time-obs --seeds 0 1 2 3 4 5
+python -m experiments.facility --aggregate --exp decoy --time-obs
+```
+
+Every run now also logs `eval_kappa`, the coupling mass
+`sum(phi_LOC - phi) / sum(r)` on its own greedy evaluation rollouts. On the
+decoy, a LOCAL arm that herds should show it there.
+
 ## Shapley backends
 
 `--shapley` on every CLI. `auto` is the default and reproduces the

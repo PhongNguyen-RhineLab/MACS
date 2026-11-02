@@ -45,6 +45,9 @@ def factory(k=2):
     (dict(mode="VDN", obs_mode="private"), "private observation"),
     (dict(mode="QMIX", clip="budget"), "unclipped"),
     (dict(mode="MACS", obs_mode="private", clip="budget"), "shared set"),
+    (dict(mode="MACS-CLIP", clip="reach"), "time_obs=True"),
+    (dict(mode="MACS-CLIP", clip="reach", time_obs=True,
+          obs_mode="private"), "shared set"),
 ])
 def test_invalid_combinations_are_rejected(kwargs, match):
     """
@@ -70,7 +73,7 @@ def test_clip_defaults_follow_the_mode():
     assert _default_clip("MACS-CLIP") == "budget"
     assert _default_clip("MACS") == "none"
     assert _default_clip("VDN") == "none"
-    assert set(CLIP_MODES) == {"none", "budget", "const"}
+    assert set(CLIP_MODES) == {"none", "budget", "const", "reach"}
 
 
 def test_training_without_torch_fails_loudly():

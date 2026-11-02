@@ -185,20 +185,44 @@ def island_demand(size, n_islands, radius, min_sep, eps, rng):
     return d, np.array(centres)
 
 
+def decoy_index(centres, size):
+    """The island nearest the grid centre (ties: lowest index). Fixed by the
+    layout alone, so it is the same island in every episode."""
+    mid = np.array([(size - 1) / 2.0, (size - 1) / 2.0])
+    return int(np.argmin(np.hypot(*(np.asarray(centres) - mid).T)))
+
+
 class IslandF(FacilityLocationF):
     """
     Facility location with sparse island demand. Still monotone submodular,
     and still a FacilityLocationF, so the closed-form Shapley backend
     applies unchanged.
+
+    decoy_mult > 1 makes one island -- the one nearest the grid centre --
+    carry decoy_mult times the demand of each other island, before the
+    usual rescale to sum size^2. That is the herding construction of the
+    equilibrium argument: an attractor worth more than any alternative to
+    every agent that ignores its teammates. decoy_mult = 1 is the original
+    benchmark, bit for bit (the demand field and RNG use are unchanged).
     """
 
     def __init__(self, size, rho, n_islands, radius, min_sep, eps,
-                 layout_seed):
+                 layout_seed, decoy_mult=1.0):
         super().__init__(size, rho=rho, demand="uniform")
         self.demand_mode = "islands"
         rng = np.random.default_rng(layout_seed)
         self.d, self.centres = island_demand(size, n_islands, radius,
                                              min_sep, eps, rng)
+        self.decoy = None
+        self.decoy_mult = float(decoy_mult)
+        if self.decoy_mult != 1.0:
+            self.decoy = decoy_index(self.centres, size)
+            xs, ys = np.meshgrid(np.arange(size), np.arange(size),
+                                 indexing="ij")
+            cx, cy = self.centres[self.decoy]
+            disc = (xs - cx) ** 2 + (ys - cy) ** 2 <= radius ** 2
+            self.d[disc] *= self.decoy_mult
+            self.d *= (size * size) / self.d.sum()
         self._Fmax = float(self.d.sum())
         self.radius = radius
 
@@ -211,16 +235,22 @@ class IslandEnv(FacilityCoverageEnv):
                  which a learner can only handle with a demand input channel;
                  use an int for the fixed-layout benchmark).
     depot        all k agents start inside a 3x3 block at a random location.
+    depot_at     None -> the block's centre is drawn per episode (original
+                 benchmark); (x, y) -> fixed centre, spawns still random
+                 within the 3x3 block. A fixed depot makes the decoy the
+                 same distance away in every episode.
+    decoy_mult   see IslandF. 1.0 is the original benchmark.
     """
 
     def __init__(self, size=24, horizon=30, k=2, rho=4.0, n_islands=8,
                  radius=1, min_sep=8, eps=0.0, layout_seed=0, depot=True,
-                 seed=None):
+                 seed=None, decoy_mult=1.0, depot_at=None):
         self.rho_hint = float(rho)
         self.depot = depot
+        self.depot_at = None if depot_at is None else tuple(depot_at)
         self.layout_seed = layout_seed
         self._isl = dict(rho=rho, n_islands=n_islands, radius=radius,
-                         min_sep=min_sep, eps=eps)
+                         min_sep=min_sep, eps=eps, decoy_mult=decoy_mult)
         self._layout_rng = np.random.default_rng(seed)
         super().__init__(size=size, horizon=horizon, k=k, patch=0, rho=rho,
                          demand="uniform", seed=seed)
@@ -235,7 +265,8 @@ class IslandEnv(FacilityCoverageEnv):
         self._new_layout()
         out = super().reset()
         if self.depot:
-            c = self.rng.integers(2, self.size - 2, size=2)
+            c = (self.rng.integers(2, self.size - 2, size=2)
+                 if self.depot_at is None else np.array(self.depot_at))
             self.pos = np.clip(c + self.rng.integers(-1, 2, size=(self.k, 2)),
                                0, self.size - 1)
             self.covered[:] = False

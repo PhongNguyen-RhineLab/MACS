@@ -72,16 +72,26 @@ if TORCH_OK:
         """
         Q_i(s^i, S, .) -- decentralized input:
           CNN channels: [coverage map, frontier, own-position one-hot]
-          MLP branch:   own position (2,) normalized
+          MLP branch:   own position (2,) normalized, plus tau/T when
+                      time_input=True
         No other agents' positions anywhere.
+
+        time_input adds the normalized time-to-go tau/T to the MLP branch,
+        so the value class is q_i(s^i, S, tau, a^i). With a finite horizon
+        and a done-masked bootstrap the target depends on tau; without it
+        the network fits one number to states whose values differ only in
+        time remaining. time_input=False builds the published architecture
+        parameter for parameter, so old runs still reproduce.
         """
 
-        def __init__(self, map_size, n_actions=5):
+        def __init__(self, map_size, n_actions=5, time_input=False):
             super().__init__()
             self.map_size = map_size
+            self.time_input = time_input
             cnn, cdim = make_cnn(map_size, in_ch=3)
             self.cnn = cnn
-            self.pos = nn.Sequential(nn.Linear(2, 32), nn.ReLU(),
+            self.pos = nn.Sequential(nn.Linear(2 + int(time_input), 32),
+                                     nn.ReLU(),
                                      nn.Linear(32, 32), nn.ReLU())
             self.head = nn.Sequential(nn.Linear(cdim + 32, 128), nn.ReLU(),
                                       nn.Linear(128, 64), nn.ReLU(),
@@ -89,8 +99,13 @@ if TORCH_OK:
             orthogonal_init(self)
             nn.init.orthogonal_(self.head[-1].weight, 1.0)
 
-        def forward(self, pos, z_map, frontier, pos_map):
+        def forward(self, pos, z_map, frontier, pos_map, tau=None):
             x = torch.stack([z_map, frontier, pos_map], dim=1)
+            if self.time_input:
+                if tau is None:
+                    raise ValueError("this network was built with "
+                                     "time_input=True and needs tau")
+                pos = torch.cat([pos, tau.view(-1, 1)], dim=1)
             return self.head(torch.cat([self.cnn(x), self.pos(pos)], dim=1))
 
     class QMixer(nn.Module):
@@ -106,12 +121,15 @@ if TORCH_OK:
         computation in MACS (which also reads all arrival positions).
         """
 
-        def __init__(self, k, map_size, embed=32, hyper_hidden=64):
+        def __init__(self, k, map_size, embed=32, hyper_hidden=64,
+                     time_input=False):
             super().__init__()
             self.k = k
             self.embed = embed
+            self.time_input = time_input
             cnn, cdim = make_cnn(map_size, in_ch=3)
             self.state_enc = cnn
+            cdim += int(time_input)        # tau/T appended to the state code
             self.hyper_w1 = nn.Sequential(
                 nn.Linear(cdim, hyper_hidden), nn.ReLU(),
                 nn.Linear(hyper_hidden, k * embed))
@@ -123,10 +141,12 @@ if TORCH_OK:
                 nn.Linear(cdim, hyper_hidden), nn.ReLU(),
                 nn.Linear(hyper_hidden, 1))
 
-        def forward(self, q_agents, z_map, frontier, all_pos_map):
+        def forward(self, q_agents, z_map, frontier, all_pos_map, tau=None):
             """q_agents: (B, k) -- each agent's Q at its chosen action."""
             s = self.state_enc(
                 torch.stack([z_map, frontier, all_pos_map], dim=1))
+            if self.time_input:
+                s = torch.cat([s, tau.view(-1, 1)], dim=1)
             B = q_agents.shape[0]
             w1 = torch.abs(self.hyper_w1(s)).view(B, self.k, self.embed)
             b1 = self.hyper_b1(s).view(B, 1, self.embed)

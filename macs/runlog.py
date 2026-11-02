@@ -10,7 +10,7 @@ logs/ is still readable and every existing plot script still works):
                  n_episodes, obs_mode, clip, seed, lr, gamma, batch_size,
                  F_total, shapley_backend, mc_m, ...},
       "per_block": {episode, coverage_mean, eval_coverage, loss, epsilon,
-                    credit_sum_err, clip_frac},
+                    credit_sum_err, clip_frac, floor_frac, reach_ratio},
       "summary": {last5_train, last10_eval, final_eval}
     }
 
@@ -32,7 +32,8 @@ from pathlib import Path
 import numpy as np
 
 BLOCK_KEYS = ("episode", "coverage_mean", "eval_coverage", "loss",
-              "epsilon", "credit_sum_err", "clip_frac")
+              "epsilon", "credit_sum_err", "clip_frac",
+              "floor_frac", "reach_ratio", "eval_kappa")
 
 
 class RunLog:
@@ -67,6 +68,18 @@ class RunLog:
                                     if block["err"] else None)
         pb["clip_frac"].append(round(float(np.mean(block["clip"])), 5)
                                if block["clip"] else 0.0)
+        # reach clip only: fraction of bootstraps lifted to the floor at 0,
+        # and mean B_i / B(S') -- how much tighter the per-agent ceiling is
+        # than the team one. None elsewhere, same convention as
+        # credit_sum_err.
+        pb["floor_frac"].append(round(float(np.mean(block["floor"])), 5)
+                                if block["floor"] else None)
+        # coupling mass on the greedy policy at the last evaluation in the
+        # block (see macs.train.run_eval); None if no evaluation ran
+        pb["eval_kappa"].append(round(float(block["eval_kappa"][-1]), 5)
+                                if block["eval_kappa"] else None)
+        pb["reach_ratio"].append(round(float(np.mean(block["reach_ratio"])),
+                                       5) if block["reach_ratio"] else None)
 
     def finish(self):
         pb = self.log["per_block"]

@@ -22,6 +22,23 @@ FACILITY = dict(size=24, horizon=60, rho=4.0, patch=0, demand="uniform")
 ISLANDS = dict(size=24, horizon=30, rho=4.0, n_islands=8, radius=1,
                min_sep=8, eps=0.0, layout_seed=0, depot=True)
 
+# Decoy islands: the islands layout with one island (nearest the grid centre)
+# carrying 3x the demand of each other one, and a shorter horizon. Chosen by
+# probes.decoy (k=6, 12 episodes, random depot), which measured, for one agent
+# leaving the herd on the decoy for its best alternative island:
+#
+#     horizon  mult | dev LOCAL  dev Shapley  dev DR | J(dev) - J(herd)
+#       30      3   |   -25.4      -10.5       -0.4  |    0.6
+#       24      2   |    -3.4       +7.7      +15.4  |    1.7
+#       20      3   |    -7.7       +5.6      +14.0  |    5.8   <- this
+#       16      3   |    -7.2       +6.2      +14.7  |    6.8
+#
+# i.e. at H=20, 3x the herd is stable under LOCAL and not under Shapley or
+# DR, and herding costs the team ~6 points of F(V). At H=30 there is enough
+# slack that a herd costs < 1 point, so no rule can lose much to it. H=16
+# gives a similar separation but plan_v only reaches ~70% of F(V).
+DECOY = dict(ISLANDS, horizon=20, decoy_mult=3.0, depot_at=None)
+
 # The saturating suite, reusing the exact configurations of Table 2.
 SATURATING = {2: dict(size=12, horizon=40),
               3: dict(size=12, horizon=40),
@@ -44,6 +61,9 @@ def env_name(kind, k=None):
         return f"Facility {FACILITY['size']}x{FACILITY['size']}"
     if kind == "islands":
         return f"Islands {ISLANDS['size']}x{ISLANDS['size']}"
+    if kind == "decoy":
+        return (f"Decoy {DECOY['size']}x{DECOY['size']} "
+                f"x{DECOY['decoy_mult']:g} H{DECOY['horizon']}")
     if kind == "saturating":
         c = SATURATING[k]
         return f"Saturating {c['size']}x{c['size']}"
@@ -90,6 +110,10 @@ ISLAND_MODES = ("SHARED", "LOCAL", "DR", "VDN", "QMIX", "MACS", "MACS-CLIP")
 # islandslr reruns the baselines across the same grid the private arm got.
 ISLANDLR_MODES = ("SHARED", "LOCAL", "DR", "VDN", "QMIX", "MACS")
 
+# The decoy experiment exists to decide MACS vs LOCAL and vs DR; the mixing
+# baselines add cost and answer a different question.
+DECOY_MODES = ("LOCAL", "DR", "MACS")
+
 SATURATING_MODES = ("SHARED", "LOCAL", "DR", "VDN", "QMIX",
                     "MACS", "MACS-CLIP")
 
@@ -99,6 +123,7 @@ LOG_DIR = {
     "o10": "logs/macs_clipcontrol",
     "islands": "logs/macs_islands",
     "islandslr": "logs/macs_islands_lr",
+    "decoy": "logs/macs_decoy",
     "saturating": "logs/macs_saturating",
     "scalability": "logs/macs_scalability",
 }

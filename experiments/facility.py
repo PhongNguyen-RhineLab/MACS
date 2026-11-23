@@ -67,11 +67,13 @@ from macs.rollout import mean_coverage
 from macs.stats import f1
 from macs.sweep import Run, cached_floors
 
-EXPERIMENTS = ("o9", "o9lr", "o10", "islands", "islandslr", "decoy")
+EXPERIMENTS = ("o9", "o9lr", "o10", "islands", "islandslr", "decoy",
+               "crowded", "baselinelr")
 
 DEFAULT_KS = {"o9": [2, 3, 4, 6, 8], "o9lr": [6],
               "islands": [3, 4, 6], "islandslr": [6], "o10": [2, 3, 4, 6],
-              "decoy": [6]}
+              "decoy": [6], "crowded": list(CFG.CROWDED_KS),
+              "baselinelr": [6]}
 
 
 # =============================================================================
@@ -239,6 +241,25 @@ def _plan(exp, ks, seeds, lr=None, modes=None):
                 for s in seeds:
                     runs.append(Run(name, k, mode, s, "shared", "none", lr,
                                     island_factory(k, CFG.DECOY)))
+    elif exp == "crowded":
+        # More agents than islands: the regime where DR under-pays.
+        name = CFG.env_name("islands")
+        for k in ks:
+            for mode in filter(keep, CFG.CROWDED_MODES):
+                for s in seeds:
+                    runs.append(Run(name, k, mode, s, "shared", "none", lr,
+                                    island_factory(k)))
+    elif exp == "baselinelr":
+        # Extend VDN's and QMIX's grids past the edge each one selected.
+        name = CFG.env_name("islands")
+        for k in ks:
+            for mode, grid in CFG.BASELINE_LR_GRID.items():
+                if not keep(mode):
+                    continue
+                for rate in grid:
+                    for s in seeds:
+                        runs.append(Run(name, k, mode, s, "shared", "none",
+                                        rate, island_factory(k)))
     elif exp == "o10":
         for k in ks:
             name = CFG.env_name("saturating", k)
@@ -282,10 +303,35 @@ COMPARISONS = {
                  "Shapley credit vs monotone mixing"),
                 ("MACS-CLIP/shared/budget", "MACS/shared/none",
                  "budget clip on top of Shapley")],
+    "crowded": [("MACS/shared/none", "DR/shared/none",
+                 "Shapley vs last-arrival marginal with shared islands"),
+                ("INT/shared/none", "DR/shared/none",
+                 "interpolated efficient credit vs last-arrival marginal"),
+                ("MACS/shared/none", "INT/shared/none",
+                 "Shapley vs interpolated efficient credit"),
+                ("MACS/shared/none", "LOCAL/shared/none",
+                 "Shapley vs first-arrival marginal with shared islands"),
+                ("MACS/shared/none", "SHARED/shared/none",
+                 "Shapley vs team reward with shared islands"),
+                ("MACS/shared/none", "VDN/shared/none",
+                 "Shapley vs additive mixing with shared islands")],
+    "baselinelr": (
+        [(f"VDN/shared/none/lr{a:g}", f"VDN/shared/none/lr{b:g}",
+          f"VDN lr {a:g} vs {b:g}")
+         for a, b in zip(CFG.BASELINE_LR_GRID["VDN"][1:],
+                         CFG.BASELINE_LR_GRID["VDN"][:-1])]
+        + [(f"QMIX/shared/none/lr{a:g}", f"QMIX/shared/none/lr{b:g}",
+            f"QMIX lr {a:g} vs {b:g}")
+           for a, b in zip(CFG.BASELINE_LR_GRID["QMIX"][1:],
+                           CFG.BASELINE_LR_GRID["QMIX"][:-1])]),
     "decoy": [("MACS/shared/none", "LOCAL/shared/none",
                "Shapley vs first-arrival marginal under a herding incentive"),
               ("MACS/shared/none", "DR/shared/none",
-               "Shapley vs last-arrival marginal under a herding incentive")],
+               "Shapley vs last-arrival marginal under a herding incentive"),
+              ("INT/shared/none", "LOCAL/shared/none",
+               "interpolated efficient credit vs first-arrival marginal"),
+              ("MACS/shared/none", "INT/shared/none",
+               "Shapley vs interpolated efficient credit")],
     "o10": [("MACS-CLIP/shared/budget", "MACS-CLIP/shared/const",
              "state-dependent vs constant ceiling"),
             ("MACS-CLIP/shared/budget", "MACS/shared/none",
@@ -348,7 +394,8 @@ def main(argv=None):
 
     if args.floors_only:
         cache = Path(log_dir) / "oracles.json"
-        if exp.startswith("islands") or exp == "decoy":
+        if exp.startswith("islands") or exp in ("decoy", "crowded",
+                                                "baselinelr"):
             fl_fn = decoy_floors if exp == "decoy" else island_floors
             env_cfg = CFG.DECOY if exp == "decoy" else CFG.ISLANDS
             print(f"{'k':>3} {'random':>9} {'sweep':>9} {'dec':>9} "
@@ -384,7 +431,7 @@ def main(argv=None):
         if exp == "decoy":
             floors = lambda k: decoy_floors(
                 k, cache_path=Path(log_dir) / "oracles.json")
-        elif exp.startswith("islands"):
+        elif exp.startswith("islands") or exp in ("crowded", "baselinelr"):
             floors = lambda k: island_floors(
                 k, cache_path=Path(log_dir) / "oracles.json")
         elif exp in ("o9", "o9lr"):

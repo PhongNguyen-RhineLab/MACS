@@ -234,7 +234,7 @@ def train(
 
     def run_eval():
         covs = []
-        over = team = 0.0
+        over = under = team = 0.0
         for j in range(n_eval):
             e = _make_env(env_factory, eval_seeds[j])
             (pn, z) = e.reset()
@@ -245,16 +245,22 @@ def train(
                 a = greedy_actions(pn, zs, frs, 0.0, tau_of(e))
                 (pn, z), r_e, done, info_e = e.step(a)
                 if r_e > 0:
-                    loc = C.compute_credits("LOCAL", r_e, info_e, e.F, k)
+                    # LOCAL over-pays by kappa, DR under-pays by the DR
+                    # deficit; both are zero exactly when no footprint
+                    # overlaps, and they bound how far any two credit rules
+                    # can disagree on this arm's own greedy behaviour.
+                    loc, dr, _ = C.marginal_bounds(info_e, e.F)
                     shp = C.compute_credits("MACS", r_e, info_e, e.F, k,
                                             backend=backend, mc_m=mc_m,
                                             rng=kappa_rng)
                     over += float(np.sum(loc) - np.sum(shp))
+                    under += float(r_e - np.sum(dr))
                     team += r_e
                 tr.update()
                 zs, frs = tr.channels(z)
             covs.append(e.total_coverage)
         block["eval_kappa"].append(over / team if team > 0 else 0.0)
+        block["eval_drdef"].append(under / team if team > 0 else 0.0)
         return float(np.mean(covs))
 
     # -- batch helpers -----------------------------------------------------

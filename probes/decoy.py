@@ -73,14 +73,16 @@ def step_credits(env, info):
                 others |= pm
         dr[i] = f_all - env.F(others)
     shp = shapley.compute(S, patches, env.F, backend="auto")
-    return {"LOCAL": loc, "MACS": shp, "DR": dr}, f_all - f0
+    from macs.credits import interpolated_credit
+    it = interpolated_credit(loc, dr, f_all - f0)
+    return {"LOCAL": loc, "MACS": shp, "DR": dr, "INT": it}, f_all - f0
 
 
 def episode_streams(env, policy, rng):
     """Discounted per-agent credit streams under every rule, plus totals."""
     env.reset()
     pol = policy(env)
-    U = {r: np.zeros(env.k) for r in ("LOCAL", "MACS", "DR")}
+    U = {r: np.zeros(env.k) for r in ("LOCAL", "MACS", "DR", "INT")}
     over = team = 0.0
     for t in range(env.horizon):
         _, _, _, info = env.step(pol(env, rng))
@@ -116,7 +118,7 @@ def deviation_gains(k, mult, depot_at, episodes, seed):
     Mean U_i(deviate) - U_i(herd) per rule. Episode e: deviator i = e % k,
     herd and deviation rolled out from the SAME spawn and the same rng.
     """
-    gains = {r: [] for r in ("LOCAL", "MACS", "DR")}
+    gains = {r: [] for r in ("LOCAL", "MACS", "DR", "INT")}
     team = {"herd": [], "deviate": []}
     cfg = island_cfg(mult, depot_at)
     for e in range(episodes):
@@ -216,7 +218,7 @@ def main(argv=None):
     hdr = (f"{'depot':>8} {'mult':>5} | {'dec':>5} {'pself':>6} {'plan':>5}"
            f" | {'plan-dec':>8} {'plan-self':>9} | {'k_self':>6} "
            f"{'k_plan':>6} | {'dev LOCAL':>10} {'dev MACS':>9} "
-           f"{'dev DR':>8} | {'J herd':>6} {'J dev':>6}")
+           f"{'dev DR':>8} {'dev INT':>8} | {'J herd':>6} {'J dev':>6}")
     print(hdr)
     print("-" * len(hdr))
     for dep_s in args.depots:
@@ -238,7 +240,7 @@ def main(argv=None):
                   f"{fl['plan_v'] - fl['plan_self_v']:>9.1f} | "
                   f"{ks:>5.1f}% {kp:>5.1f}% | "
                   f"{g['LOCAL'][0]:>+10.2f} {g['MACS'][0]:>+9.2f} "
-                  f"{g['DR'][0]:>+8.2f} | {J['herd']:>6.1f} "
+                  f"{g['DR'][0]:>+8.2f} {g['INT'][0]:>+8.2f} | {J['herd']:>6.1f} "
                   f"{J['deviate']:>6.1f}")
     print("\nfloors and J in % of F(V); deviation gains in raw discounted "
           "credit (F(V) = 576).\nThe variant does its job where dev LOCAL "

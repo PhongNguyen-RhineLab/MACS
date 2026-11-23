@@ -33,7 +33,7 @@ import numpy as np
 
 BLOCK_KEYS = ("episode", "coverage_mean", "eval_coverage", "loss",
               "epsilon", "credit_sum_err", "clip_frac",
-              "floor_frac", "reach_ratio", "eval_kappa")
+              "floor_frac", "reach_ratio", "eval_kappa", "eval_drdef")
 
 
 class RunLog:
@@ -78,6 +78,12 @@ class RunLog:
         # block (see macs.train.run_eval); None if no evaluation ran
         pb["eval_kappa"].append(round(float(block["eval_kappa"][-1]), 5)
                                 if block["eval_kappa"] else None)
+        # DR deficit 1 - sum(DR)/r on the same rollouts: how much difference
+        # rewards under-pay this arm's greedy behaviour. setdefault keeps
+        # logs written before the key existed appendable on resume.
+        pb.setdefault("eval_drdef", [None] * (len(pb["episode"]) - 1))
+        pb["eval_drdef"].append(round(float(block["eval_drdef"][-1]), 5)
+                                if block.get("eval_drdef") else None)
         pb["reach_ratio"].append(round(float(np.mean(block["reach_ratio"])),
                                        5) if block["reach_ratio"] else None)
 

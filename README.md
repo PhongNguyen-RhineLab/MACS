@@ -18,7 +18,7 @@ credit : v(C) = F(S_t u  u_{i in C} P(s_{t+1}^i)) - F(S_t),  phi = Shapley(v)
 
 ```bash
 pip install -r requirements.txt     # torch is needed for training only
-python -m pytest                    # 156 tests, numpy only, ~5 s
+python -m pytest                    # numpy only, a few seconds
 ```
 
 Everything except training runs on numpy: the credit rules, the
@@ -58,9 +58,47 @@ tests/
 | `SHARED` | `r_t` to everyone | sums to `k * r_t` |
 | `LOCAL` | `F(S u P_i) - F(S)` | first-arrival, over-counts on overlap |
 | `DR` | `F(S u all) - F(S u others)` | last-arrival, under-counts |
+| `INT` | `DR + lam (LOC - DR)`, one `lam` per step | efficient, inside `[DR, LOCAL]`, 2k+2 evals of F |
 | `VDN` / `QMIX` | no credit rule; joint TD on `r_t` | decomposition by architecture |
 
 For submodular `F`, per agent and per step: `DR <= Shapley <= LOCAL`.
+
+A rule is *admissible* if it is efficient and stays in that bracket. Every
+learning, equilibrium and budget result of the paper uses only those three
+properties, so they hold for Shapley (`MACS`, exact or Monte Carlo) and for
+`INT` alike. `INT` equals Shapley at k = 2 and is tested in
+`tests/test_interpolated.py`.
+
+## Where can credit rules disagree? (no training)
+
+```bash
+python -m probes.sandwich --episodes 10 --json logs/sandwich.json
+```
+
+reports, on scripted play, LOCAL's over-payment `kappa`, DR's under-payment
+`rho_DR` (both discounted, % of the team reward), and the distance between
+`INT` and Shapley credit. Any two admissible rules differ by at most
+`2 min(kappa, rho_DR)` per step; DR's fixed point loses at most `rho_DR` of an
+optimal policy's return. Training runs now also log `eval_drdef` (on-policy
+`rho_DR`, undiscounted) beside `eval_kappa`.
+
+## Crowded islands
+
+`--exp crowded` is the islands map with k = 8, 12, 16 (more agents than
+islands), where `rho_DR` under coordinated play is 12-35%: the regime in
+which admissible rules and DR can separate. `--exp baselinelr` extends VDN's
+and QMIX's learning-rate grids past the edges they selected.
+
+## Learning curves from existing logs
+
+```bash
+python -m scripts.curves --log-dir logs/final_islands \
+    --pairs MACS:DR MACS:LOCAL INT:DR INT:MACS MACS:SHARED MACS:VDN \
+    --plot figures/curves_islands.pdf --json logs/curves_islands.json
+```
+
+paired area-under-curve, first-half AUC and episodes-to-90% comparisons, with
+exact sign-flip p and bootstrap intervals. Nothing is retrained.
 
 ## Time-to-go and the reach clip
 

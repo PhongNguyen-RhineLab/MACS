@@ -103,7 +103,8 @@ LR_GRID = [5e-4, 2e-4, 1e-4, 5e-5]
 # rate is interior; kept separate from LR_GRID so the o9lr plan is unchanged.
 ISLANDLR_GRID = [5e-4, 2e-4, 1e-4, 5e-5, 2e-5, 1e-5]
 
-ISLAND_MODES = ("SHARED", "LOCAL", "DR", "VDN", "QMIX", "MACS", "MACS-CLIP")
+ISLAND_MODES = ("SHARED", "LOCAL", "DR", "INT", "VDN", "QMIX", "MACS",
+                "MACS-CLIP")
 
 # The k=6 pilot flagged VDN and QMIX as diverging at the published 5e-4. A
 # reviewer will read an untuned baseline as a stacked comparison, so
@@ -112,7 +113,22 @@ ISLANDLR_MODES = ("SHARED", "LOCAL", "DR", "VDN", "QMIX", "MACS")
 
 # The decoy experiment exists to decide MACS vs LOCAL and vs DR; the mixing
 # baselines add cost and answer a different question.
-DECOY_MODES = ("LOCAL", "DR", "MACS")
+DECOY_MODES = ("LOCAL", "DR", "INT", "MACS")
+
+# Crowded islands: the plain islands layout with more agents than islands
+# (8 islands). Several agents must share an island, footprints overlap, and
+# difference rewards under-pay: the DR deficit 1 - sum(DR)/r measured by
+# probes.sandwich is what this suite exists to raise. Facility credits are
+# closed form, so Shapley costs O(|D| k log k) even at k = 16.
+CROWDED_KS = (8, 12, 16)
+CROWDED_MODES = ("SHARED", "LOCAL", "DR", "INT", "MACS", "VDN")
+
+# Baseline learning-rate extension. On the final protocol VDN selected the
+# LOW edge of ISLANDLR_GRID (1e-5) and QMIX the HIGH edge (5e-4); a selected
+# rate at a grid edge is not a tuned rate. Each grid starts at the old edge
+# and extends past it.
+BASELINE_LR_GRID = {"VDN": [1e-5, 5e-6, 2e-6, 1e-6],
+                    "QMIX": [5e-4, 1e-3, 2e-3, 5e-3]}
 
 SATURATING_MODES = ("SHARED", "LOCAL", "DR", "VDN", "QMIX",
                     "MACS", "MACS-CLIP")
@@ -124,6 +140,8 @@ LOG_DIR = {
     "islands": "logs/macs_islands",
     "islandslr": "logs/macs_islands_lr",
     "decoy": "logs/macs_decoy",
+    "crowded": "logs/macs_crowded",
+    "baselinelr": "logs/macs_baseline_lr",
     "saturating": "logs/macs_saturating",
     "scalability": "logs/macs_scalability",
 }

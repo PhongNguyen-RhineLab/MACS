@@ -34,3 +34,19 @@ def test_auc_detects_faster_arm(tmp_path):
     assert row["t90"]["diff"] < 0
     same = curves.compare(cur, "MACS", "LOCAL")
     assert abs(same["auc"]["diff"]) < 1e-9
+
+
+def test_seeds_merge_across_directories(tmp_path):
+    a, b = tmp_path / "old", tmp_path / "new"
+    a.mkdir(); b.mkdir()
+    for s in range(3):
+        _write(a, "MACS", s, rate=2.0)
+        _write(a, "DR", s, rate=1.0)
+    for s in range(3, 6):
+        _write(b, "MACS", s, rate=2.0)
+        _write(b, "DR", s, rate=1.0)
+    rc = curves.main(["--log-dir", str(a), str(b), "--pairs", "MACS:DR",
+                      "--json", str(tmp_path / "out.json")])
+    assert rc == 0
+    rows = json.loads((tmp_path / "out.json").read_text())
+    assert rows[0]["n"] == 6

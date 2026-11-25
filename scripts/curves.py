@@ -142,7 +142,10 @@ def main(argv=None):
     curves = {}
     for d in args.log_dir:
         for key, arms in load_curves(d).items():
-            curves.setdefault(key, {}).update(arms)
+            # merge per seed: old seeds 1-6 and new seeds 7-12 of one arm may
+            # sit in different directories
+            for mode, by_seed in arms.items():
+                curves.setdefault(key, {}).setdefault(mode, {}).update(by_seed)
     if not curves:
         print("no logs found")
         return 1

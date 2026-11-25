@@ -13,6 +13,10 @@ A run interrupted half way restarts from scratch, so the budget matters.
               pipeline and time a run before committing a session
 
 Workers are spread over the visible GPUs round-robin (Kaggle T4 x2 gets both).
+
+--fused auto (default) trains the k agent networks as one batched ensemble
+(macs.ensemble) whenever the worker sees a GPU, and with the per-agent loop on
+CPU, where batching is slower. Same update either way (tests/test_ensemble.py).
 """
 
 import argparse
@@ -60,6 +64,11 @@ def _gpu_worker(job):
     # must run before torch is imported in this (spawned) process
     if job.get("gpu") is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(job["gpu"])
+    fused = job.get("fused", "auto")
+    if fused == "auto":
+        import torch
+        fused = torch.cuda.is_available()
+    job = dict(job, cfg=dict(job["cfg"], fused=bool(fused)))
     from experiments.parallel import _worker
     return _worker(job)
 
@@ -113,7 +122,7 @@ def summarize(jobs):
 
 
 def run(names, log_root, hours, workers, gpus, smoke=False, dry_run=False,
-        first_run_hours=None, worker_fn=None):
+        first_run_hours=None, worker_fn=None, fused="auto"):
     jobs = build_jobs(names, log_root, smoke=smoke)
     print("Status before this session:")
     summarize(jobs)
@@ -156,7 +165,8 @@ def run(names, log_root, hours, workers, gpus, smoke=False, dry_run=False,
                 if est_hours(j["k"]) > left_h:
                     break
                 pending.pop(0)
-                j = dict(j, gpu=(gpus[slot % len(gpus)] if gpus else None))
+                j = dict(j, gpu=(gpus[slot % len(gpus)] if gpus else None),
+                         fused=fused)
                 slot += 1
                 in_flight[j["label"]] = (pool.apply_async(worker_fn, (j,)),
                                          j, time.time())
@@ -209,6 +219,7 @@ def main(argv=None):
     ap.add_argument("--first-run-hours", type=float, default=None,
                     help="time estimate before any run has finished "
                          "(default: a quarter of the budget)")
+    ap.add_argument("--fused", choices=["auto", "on", "off"], default="auto")
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
@@ -221,7 +232,8 @@ def main(argv=None):
             gpus = []
     return run(args.batches, args.log_root, args.hours, args.workers, gpus,
                smoke=args.smoke, dry_run=args.dry_run,
-               first_run_hours=args.first_run_hours)
+               first_run_hours=args.first_run_hours,
+               fused={"auto": "auto", "on": True, "off": False}[args.fused])
 
 
 if __name__ == "__main__":

@@ -103,9 +103,16 @@ def train(
     target_every=50, eval_every=100, n_eval=8,
     label=None, log_dir="logs/macs", log_every=100, seed=0,
     grad_clip=5.0, diag=False, diag_episodes=32, credit_fn=None,
-    time_obs=False, reach_discounted=True,
+    time_obs=False, reach_discounted=True, fused=False,
 ):
-    """Train one arm and write its log. Returns the log dict."""
+    """Train one arm and write its log. Returns the log dict.
+
+    fused=True evaluates and updates the k agent networks as one batched
+    (vmapped) ensemble, macs.ensemble: the same model, data and update,
+    equal to the per-agent loop up to floating-point summation order
+    (tests/test_ensemble.py). It removes the k-fold kernel-launch cost that
+    dominates on a GPU, which matters most at large k.
+    """
     # Dependency injection rather than module mutation: the scalability
     # sweep wraps this to time credit computation without patching anything.
     credit_fn = credit_fn or C.compute_credits
@@ -165,6 +172,14 @@ def train(
         for p in qt.parameters():
             p.requires_grad_(False)
     opts = [optim.Adam(q.parameters(), lr=lr, eps=1e-5) for q in nets]
+    ens = tens = ens_opt = None
+    if fused:
+        from macs.ensemble import AgentEnsemble
+        # built from the per-agent nets, so both paths start from the same
+        # weights; one Adam over the stacked tensors is k independent Adams
+        ens = AgentEnsemble(nets)
+        tens = AgentEnsemble(targets, requires_grad=False)
+        ens_opt = optim.Adam(ens.parameters(), lr=lr, eps=1e-5)
 
     mixer = target_mixer = mix_opt = None
     if mode == "QMIX":
@@ -189,6 +204,7 @@ def train(
         env_seeds=(dict(train=train_seed, eval=eval_seeds) if seeded
                    else None),
         reach_discounted=(reach_discounted if clip == "reach" else None),
+        fused=bool(fused),
     ), log_dir=log_dir)
 
     print(f"\n{'=' * 66}\n  {label}\n  k={k} size={size} H={H} mode={mode} "
@@ -213,6 +229,18 @@ def train(
         zt = torch.tensor(zs, dtype=torch.float32, device=N.DEVICE)
         ft = torch.tensor(frs, dtype=torch.float32, device=N.DEVICE)
         pm = N.pos_maps(pt, size, N.DEVICE)
+        if ens is not None and nets_ is nets:
+            # one batched forward for all agents; the RNG is consumed in the
+            # same order as the loop below, so both paths act identically
+            with torch.no_grad():
+                qa = ens.q(pt[:, None], zt[:, None], ft[:, None], pm[:, None],
+                           tt)[:, 0]
+            for i in range(k):
+                if rng.random() < epsilon:
+                    acts[i] = rng.integers(env.n_actions)
+                else:
+                    acts[i] = int(qa[i].argmax())
+            return acts
         with torch.no_grad():
             for i in range(k):
                 if rng.random() < epsilon:
@@ -291,8 +319,80 @@ def train(
         for o in extra:
             o.step()
 
+    # -- fused learning ----------------------------------------------------
+    def ens_q(E, bp, bz, bf, btau):
+        """(k, B, n_actions) from batch tensors laid out (B, k, ...)."""
+        B = bp.shape[0]
+        pos = bp.transpose(0, 1).contiguous()                  # (k, B, 2)
+        pm = N.pos_maps(pos.reshape(k * B, 2), size, N.DEVICE)
+        return E.q(pos, bz.transpose(0, 1), bf.transpose(0, 1),
+                   pm.reshape(k, B, size, size), btau)
+
+    def fused_step(loss, extra=()):
+        ens_opt.zero_grad()
+        for o in extra:
+            o.zero_grad()
+        loss.backward()
+        ens.clip_grad_norm_(grad_clip)
+        if mixer is not None:
+            nn.utils.clip_grad_norm_(mixer.parameters(), grad_clip)
+        ens_opt.step()
+        for o in extra:
+            o.step()
+
+    def learn_fused(batch):
+        bp, bz, bf = stack(batch, 0), stack(batch, 1), stack(batch, 2)
+        ba = stack(batch, 3, torch.long)
+        bphi, br = stack(batch, 4), stack(batch, 5)
+        bp2, bz2, bf2 = stack(batch, 6), stack(batch, 7), stack(batch, 8)
+        bd, bbud = stack(batch, 9), stack(batch, 10)
+        bt, bt2 = ((stack(batch, 11), stack(batch, 12)) if time_obs
+                   else (None, None))
+        qa = ens_q(ens, bp, bz, bf, bt).gather(
+            2, ba.t().unsqueeze(-1)).squeeze(-1)                # (k, B)
+        with torch.no_grad():
+            boot = ens_q(tens, bp2, bz2, bf2, bt2).max(-1).values
+
+        if mode == "VDN":
+            with torch.no_grad():
+                y = br + gamma * (1 - bd) * boot.sum(0)
+            loss = nn.functional.mse_loss(qa.sum(0), y)
+            fused_step(loss)
+            return loss.item()
+
+        if mode == "QMIX":
+            pm_all = N.pos_maps_all(bp, size, N.DEVICE)
+            pm_all2 = N.pos_maps_all(bp2, size, N.DEVICE)
+            q_tot = mixer(qa.t(), bz[:, 0], bf[:, 0], pm_all, bt)
+            with torch.no_grad():
+                y_tot = target_mixer(boot.t(), bz2[:, 0], bf2[:, 0], pm_all2,
+                                     bt2)
+                y = br + gamma * (1 - bd) * y_tot
+            loss = nn.functional.mse_loss(q_tot, y)
+            fused_step(loss, extra=(mix_opt,))
+            return loss.item()
+
+        with torch.no_grad():
+            if clip != "none":
+                ceil = (bbud.t() if clip in ("budget", "reach")
+                        else torch.full_like(boot, const_c))
+                block["clip"].extend(
+                    (boot > ceil).float().mean(1).tolist())
+                boot = torch.minimum(boot, ceil)
+            if clip == "reach":
+                block["floor"].extend((boot < 0).float().mean(1).tolist())
+                boot = torch.clamp(boot, min=0.0)
+            y = bphi.t() + gamma * (1 - bd) * boot               # (k, B)
+        per_agent = ((qa - y) ** 2).mean(1)                    # (k,)
+        # agents' parameters are disjoint, so d(sum)/d(theta_i) is the
+        # gradient of agent i's own loss
+        fused_step(per_agent.sum())
+        return float(per_agent.mean().item())
+
     # -- learning ----------------------------------------------------------
     def learn(batch):
+        if ens is not None:
+            return learn_fused(batch)
         nonlocal const_c
         bp, bz, bf = stack(batch, 0), stack(batch, 1), stack(batch, 2)
         ba = stack(batch, 3, torch.long)
@@ -413,6 +513,8 @@ def train(
         block["cov"].append(env.total_coverage)
 
         if ep_i % target_every == 0:
+            if ens is not None:
+                tens.copy_from(ens)
             for q, qt in zip(nets, targets):
                 qt.load_state_dict(q.state_dict())
             if mixer is not None:
@@ -433,6 +535,8 @@ def train(
             run.save()
 
     run.finish()
+    if ens is not None:
+        ens.write_back(nets)             # per-agent modules hold the result
     if diag:
         run.log["diag"] = _run_diagnostic(env_factory, nets, size, obs_mode,
                                           k, H, diag_episodes, seed, label)
